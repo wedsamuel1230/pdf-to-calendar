@@ -1,7 +1,7 @@
 {
 	"name": "pdf-to-calendar",
 	"private": true,
-	"version": "0.1.2",
+	"version": "0.1.3",
 	"description": "Desktop app to parse timetable PDFs and import events into Notion Calendar databases.",
 	"license": "MIT",
 	"author": "Samuel F.",

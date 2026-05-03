@@ -1,7 +1,7 @@
 # PDF to Calendar
 
 [![CI](https://img.shields.io/github/actions/workflow/status/wedsamuel1230/pdf-to-calendar/ci.yml?branch=main&label=CI)](https://github.com/wedsamuel1230/pdf-to-calendar/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/actions/workflow/status/wedsamuel1230/pdf-to-calendar/release-desktop.yml?label=Release)](https://github.com/wedsamuel1230/pdf-to-calendar/actions/workflows/release-desktop.yml)
+[![Publish](https://img.shields.io/github/actions/workflow/status/wedsamuel1230/pdf-to-calendar/publish-desktop.yml?label=Publish)](https://github.com/wedsamuel1230/pdf-to-calendar/actions/workflows/publish-desktop.yml)
 [![License: MIT](https://img.shields.io/github/license/wedsamuel1230/pdf-to-calendar)](./LICENSE)
 
 Desktop app that parses timetable PDFs and imports event rows into a Notion database for calendar use.

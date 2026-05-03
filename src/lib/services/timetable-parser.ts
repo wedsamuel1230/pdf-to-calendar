@@ -410,38 +410,41 @@ function sortLessons(lessons: ParsedLesson[]): ParsedLesson[] {
 	});
 }
 
-function parseTime(time: string): [number, number] {
-	const [hourText, minuteText] = time.split(':');
-	return [Number(hourText), Number(minuteText)];
-}
-
 function formatDate(date: Date): string {
-	const year = date.getFullYear().toString().padStart(4, '0');
-	const month = (date.getMonth() + 1).toString().padStart(2, '0');
-	const day = date.getDate().toString().padStart(2, '0');
+	const year = date.getUTCFullYear().toString().padStart(4, '0');
+	const month = (date.getUTCMonth() + 1).toString().padStart(2, '0');
+	const day = date.getUTCDate().toString().padStart(2, '0');
 	return `${year}-${month}-${day}`;
 }
 
 function isoWithHongKongOffset(date: Date, time: string): string {
-	const [hours, minutes] = parseTime(time);
-	const copy = new Date(date);
-	copy.setHours(hours, minutes, 0, 0);
-	return `${formatDate(copy)}T${hours.toString().padStart(2, '0')}:${minutes
-		.toString()
-		.padStart(2, '0')}:00${HK_OFFSET}`;
+	const [hourText, minuteText] = time.split(':');
+	return `${formatDate(date)}T${hourText.padStart(2, '0')}:${minuteText.padStart(2, '0')}:00${HK_OFFSET}`;
 }
 
 function addDays(base: Date, amount: number): Date {
 	const copy = new Date(base);
-	copy.setDate(copy.getDate() + amount);
+	copy.setUTCDate(copy.getUTCDate() + amount);
 	return copy;
 }
 
-function expandLessonsToOccurrences(lessons: ParsedLesson[], startWeekDate: string, minWeek: number): LessonOccurrence[] {
-	const mondayDate = new Date(`${startWeekDate}T00:00:00+08:00`);
-	if (Number.isNaN(mondayDate.getTime())) {
+function parseStartWeekDate(value: string): Date {
+	const match = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+	if (!match) {
 		throw new Error('Invalid starting week date.');
 	}
+	const year = Number(match[1]);
+	const month = Number(match[2]);
+	const day = Number(match[3]);
+	const date = new Date(Date.UTC(year, month - 1, day));
+	if (Number.isNaN(date.getTime())) {
+		throw new Error('Invalid starting week date.');
+	}
+	return date;
+}
+
+function expandLessonsToOccurrences(lessons: ParsedLesson[], startWeekDate: string, minWeek: number): LessonOccurrence[] {
+	const mondayDate = parseStartWeekDate(startWeekDate);
 
 	const occurrences: LessonOccurrence[] = [];
 	for (const lesson of lessons) {
