@@ -22,11 +22,12 @@ pub fn load_persisted_config(app: &AppHandle, has_token: bool) -> Result<NotionC
     if !path.exists() {
         return Ok(NotionConfig {
             database_id_or_url: DEFAULT_DATABASE_ID_OR_URL.to_string(),
-            date_property_name: "Start Time".to_string(),
+            date_property_name: "Time".to_string(),
             title_property_name: "Class/Event".to_string(),
             timezone: "Asia/Hong_Kong".to_string(),
             has_token,
             token_source,
+            token_env_var_name: None,
         });
     }
 
@@ -39,6 +40,7 @@ pub fn load_persisted_config(app: &AppHandle, has_token: bool) -> Result<NotionC
         timezone: parsed.timezone,
         has_token,
         token_source,
+        token_env_var_name: None,
     })
 }
 
@@ -50,8 +52,8 @@ fn migrate_title_property_name(value: &str) -> String {
 }
 
 fn migrate_date_property_name(value: &str) -> String {
-    if value.trim() == "Date" {
-        return "Start Time".to_string();
+    if value.trim() == "Date" || value.trim() == "Start Time" {
+        return "Time".to_string();
     }
     value.to_string()
 }
@@ -82,5 +84,6 @@ pub fn save_persisted_config(
         timezone: record.timezone,
         has_token,
         token_source: token_source.to_string(),
+        token_env_var_name: None,
     })
 }

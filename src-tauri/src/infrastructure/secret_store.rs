@@ -27,18 +27,34 @@ impl TokenSource {
 pub struct ResolvedToken {
     pub value: String,
     pub source: TokenSource,
+    pub source_env_var: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TokenStatus {
+    pub source: Option<TokenSource>,
+    pub env_var_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct EnvToken {
+    key: String,
+    value: String,
 }
 
 fn entry() -> Result<Entry, AppError> {
     Ok(Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)?)
 }
 
-fn load_env_token() -> Option<String> {
+fn load_env_token() -> Option<EnvToken> {
     for key in NOTION_TOKEN_ENV_VARS {
         if let Ok(value) = env::var(key) {
             let trimmed = value.trim();
             if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
+                return Some(EnvToken {
+                    key: key.to_string(),
+                    value: trimmed.to_string(),
+                });
             }
         }
     }
@@ -55,10 +71,11 @@ pub fn load_token() -> Result<Option<String>, AppError> {
 }
 
 pub fn load_resolved_token(input_token: Option<String>) -> Result<Option<ResolvedToken>, AppError> {
-    if let Some(value) = load_env_token() {
+    if let Some(env_token) = load_env_token() {
         return Ok(Some(ResolvedToken {
-            value,
+            value: env_token.value,
             source: TokenSource::Environment,
+            source_env_var: Some(env_token.key),
         }));
     }
 
@@ -69,12 +86,14 @@ pub fn load_resolved_token(input_token: Option<String>) -> Result<Option<Resolve
         return Ok(Some(ResolvedToken {
             value,
             source: TokenSource::Keychain,
+            source_env_var: None,
         }));
     }
 
     Ok(load_token()?.map(|value| ResolvedToken {
         value,
         source: TokenSource::Keychain,
+        source_env_var: None,
     }))
 }
 
@@ -84,6 +103,27 @@ pub fn detect_token_source() -> Result<Option<TokenSource>, AppError> {
     }
 
     Ok(load_token()?.map(|_| TokenSource::Keychain))
+}
+
+pub fn detect_token_status() -> Result<TokenStatus, AppError> {
+    if let Some(env_token) = load_env_token() {
+        return Ok(TokenStatus {
+            source: Some(TokenSource::Environment),
+            env_var_name: Some(env_token.key),
+        });
+    }
+
+    if load_token()?.is_some() {
+        return Ok(TokenStatus {
+            source: Some(TokenSource::Keychain),
+            env_var_name: None,
+        });
+    }
+
+    Ok(TokenStatus {
+        source: None,
+        env_var_name: None,
+    })
 }
 
 pub fn save_token(token: &str) -> Result<(), AppError> {

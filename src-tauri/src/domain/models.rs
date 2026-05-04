@@ -19,6 +19,7 @@ pub struct NotionConfig {
     pub timezone: String,
     pub has_token: bool,
     pub token_source: String,
+    pub token_env_var_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +101,7 @@ pub struct ParsedLessonForRepair {
 pub struct RepairLessonsInput {
     pub lessons: Vec<ParsedLessonForRepair>,
     pub model: Option<String>,
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -26,10 +26,7 @@ pub struct DatabasePropertyDefinition {
 }
 
 const DAY_PROPERTY: &str = "Day";
-const START_DATE_PROPERTY: &str = "Start Date";
-const START_TIME_PROPERTY: &str = "Start Time";
-const END_TIME_PROPERTY: &str = "End Time";
-const END_DATE_PROPERTY: &str = "End Date";
+const TIME_PROPERTY: &str = "Time";
 const LOCATION_PROPERTY: &str = "Location";
 const INSTRUCTOR_PROPERTY: &str = "Instructor";
 
@@ -130,10 +127,7 @@ impl NotionClient {
         properties.insert(date_property_name.to_string(), json!({ "date": {} }));
         for (name, definition) in [
             (DAY_PROPERTY, json!({ "select": {} })),
-            (START_DATE_PROPERTY, json!({ "date": {} })),
-            (START_TIME_PROPERTY, json!({ "date": {} })),
-            (END_TIME_PROPERTY, json!({ "date": {} })),
-            (END_DATE_PROPERTY, json!({ "date": {} })),
+            (TIME_PROPERTY, json!({ "date": {} })),
             (LOCATION_PROPERTY, json!({ "rich_text": {} })),
             (INSTRUCTOR_PROPERTY, json!({ "rich_text": {} })),
         ] {
@@ -179,7 +173,7 @@ impl NotionClient {
     ) -> Result<HashSet<String>, AppError> {
         let url = format!("{}/v1/databases/{database_id}/query", self.base_url);
         let start_time_property =
-            resolve_property_name(schema, START_TIME_PROPERTY, &["starttime"], "date")
+            resolve_property_name(schema, TIME_PROPERTY, &["time", "starttime"], "date")
                 .unwrap_or_else(|| fallback_date_property_name.to_string());
         let mut cursor: Option<String> = None;
         let mut keys = HashSet::new();
@@ -327,11 +321,18 @@ fn build_properties_payload(
 
         if property.name == date_property_name && property.property_type == "date" {
             let normalized = normalize_property_name(&property.name);
-            if matches_alias(&normalized, &["datetime", "date", "classdate", "eventdate"]) {
+            if matches_alias(
+                &normalized,
+                &["time", "datetime", "date", "classdate", "eventdate"],
+            ) {
                 properties.insert(
                     property.name.clone(),
                     date_range_value(&occurrence.start_iso, &occurrence.end_iso),
                 );
+                continue;
+            }
+            if matches_alias(&normalized, &["starttime"]) {
+                properties.insert(property.name.clone(), date_value(&occurrence.start_iso));
                 continue;
             }
         }
@@ -352,24 +353,12 @@ fn map_occurrence_property(
     if property.property_type == "date" {
         if matches_alias(
             &normalized_name,
-            &["startdate", "datefrom", "classstartdate", "eventstartdate"],
+            &["time", "datetime", "classdate", "eventdate"],
         ) {
-            return Some(date_only_value(&occurrence.start_iso));
-        }
-        if matches_alias(
-            &normalized_name,
-            &["enddate", "dateto", "classenddate", "eventenddate"],
-        ) {
-            return Some(date_only_value(&occurrence.end_iso));
+            return Some(date_range_value(&occurrence.start_iso, &occurrence.end_iso));
         }
         if matches_alias(&normalized_name, &["starttime", "start"]) {
             return Some(date_value(&occurrence.start_iso));
-        }
-        if matches_alias(&normalized_name, &["endtime", "end"]) {
-            return Some(date_value(&occurrence.end_iso));
-        }
-        if matches_alias(&normalized_name, &["datetime", "classdate", "eventdate"]) {
-            return Some(date_range_value(&occurrence.start_iso, &occurrence.end_iso));
         }
     }
 
@@ -438,11 +427,6 @@ fn map_occurrence_property(
 
 fn date_value(start: &str) -> Value {
     json!({ "date": { "start": start } })
-}
-
-fn date_only_value(iso: &str) -> Value {
-    let date_only = iso.split('T').next().unwrap_or(iso);
-    json!({ "date": { "start": date_only } })
 }
 
 fn date_range_value(start: &str, end: &str) -> Value {

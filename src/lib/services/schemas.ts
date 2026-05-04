@@ -6,7 +6,7 @@ const timeZoneDefault = 'Asia/Hong_Kong';
 export const notionConfigSchema = z.object({
 	token: z.string().trim().min(1).optional(),
 	databaseIdOrUrl: z.string().trim().min(1, 'Database ID or URL is required'),
-	datePropertyName: z.string().trim().min(1, 'Date property is required').default('Start Time'),
+	datePropertyName: z.string().trim().min(1, 'Date property is required').default('Time'),
 	titlePropertyName: z.string().trim().min(1, 'Title property is required').default('Class/Event'),
 	timezone: z.string().trim().min(1).default(timeZoneDefault)
 });
@@ -15,7 +15,7 @@ export const notionDatabaseSetupSchema = z.object({
 	token: z.string().trim().min(1).optional(),
 	parentPageIdOrUrl: z.string().trim().min(1, 'Parent page URL or ID is required'),
 	databaseName: z.string().trim().min(1, 'Database name is required').default('Timetable Calendar'),
-	datePropertyName: z.string().trim().min(1, 'Date property is required').default('Start Time'),
+	datePropertyName: z.string().trim().min(1, 'Date property is required').default('Time'),
 	titlePropertyName: z.string().trim().min(1, 'Title property is required').default('Class/Event'),
 	timezone: z.string().trim().min(1).default(timeZoneDefault)
 });

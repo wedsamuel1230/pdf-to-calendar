@@ -21,6 +21,8 @@ static DATABASE_ID_REGEX: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"([0-9a-fA-F]{32}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})")
     .expect("database regex should compile")
 });
+const LOCKED_TITLE_PROPERTY: &str = "Class/Event";
+const LOCKED_DATE_PROPERTY: &str = "Time";
 
 #[derive(Clone)]
 pub struct NotionService {
@@ -37,26 +39,33 @@ impl NotionService {
     }
 
     pub fn load_config(&self) -> Result<NotionConfig, AppError> {
-        let token_source = secret_store::detect_token_source()?;
-        let has_token = token_source.is_some();
+        let token_status = secret_store::detect_token_status()?;
+        let has_token = token_status.source.is_some();
         let mut config = config_store::load_persisted_config(&self.app, has_token)?;
-        config.token_source = token_source
+        config.title_property_name = LOCKED_TITLE_PROPERTY.to_string();
+        config.date_property_name = LOCKED_DATE_PROPERTY.to_string();
+        config.token_source = token_status
+            .source
             .map(|source| source.as_str().to_string())
             .unwrap_or_else(|| "none".to_string());
+        config.token_env_var_name = token_status.env_var_name;
         Ok(config)
     }
 
     pub fn save_config(&self, input: NotionConfigInput) -> Result<NotionConfig, AppError> {
-        let config = input.normalized();
+        let mut config = input.normalized();
+        config.title_property_name = LOCKED_TITLE_PROPERTY.to_string();
+        config.date_property_name = LOCKED_DATE_PROPERTY.to_string();
         self.validate_config(&config)?;
 
         if let Some(token) = config.token.as_ref() {
             secret_store::save_token(token)?;
         }
 
-        let token_source = secret_store::detect_token_source()?;
-        let has_token = token_source.is_some() || config.token.is_some();
-        let token_source_label = token_source
+        let token_status = secret_store::detect_token_status()?;
+        let has_token = token_status.source.is_some() || config.token.is_some();
+        let token_source_label = token_status
+            .source
             .map(|source| source.as_str().to_string())
             .unwrap_or_else(|| {
                 if config.token.is_some() {
@@ -72,7 +81,9 @@ impl NotionService {
         &self,
         input: NotionConfigInput,
     ) -> Result<ConnectionResult, AppError> {
-        let config = input.normalized();
+        let mut config = input.normalized();
+        config.title_property_name = LOCKED_TITLE_PROPERTY.to_string();
+        config.date_property_name = LOCKED_DATE_PROPERTY.to_string();
         self.validate_config(&config)?;
         let token = self.resolve_token(config.token)?;
         let database_id = extract_database_id(&config.database_id_or_url)?;
@@ -85,11 +96,17 @@ impl NotionService {
             return Err(map_notion_access_error(&config.database_id_or_url, error));
         }
 
+        let token_source_label = if let Some(env_var_name) = token.source_env_var.as_deref() {
+            format!("{} ({env_var_name})", token.source.as_str())
+        } else {
+            token.source.as_str().to_string()
+        };
+
         Ok(ConnectionResult {
             ok: true,
             message: format!(
                 "Connected using {} token. Database {database_id} is reachable.",
-                token.source.as_str()
+                token_source_label
             ),
         })
     }
@@ -98,7 +115,9 @@ impl NotionService {
         &self,
         input: CreateNotionDatabaseInput,
     ) -> Result<CreateNotionDatabaseResult, AppError> {
-        let input = input.normalized();
+        let mut input = input.normalized();
+        input.title_property_name = LOCKED_TITLE_PROPERTY.to_string();
+        input.date_property_name = LOCKED_DATE_PROPERTY.to_string();
         self.validate_database_setup(&input)?;
         let token = self.resolve_token(input.token.clone())?;
         let parent_page_id = extract_notion_id(&input.parent_page_id_or_url)?;
@@ -190,8 +209,8 @@ impl NotionService {
         })?;
         let date_property_name = resolve_property_name(
             &schema,
-            "Start Time",
-            &["starttime", "datetime", "date"],
+            "Time",
+            &["time", "starttime"],
             "date",
         )
         .ok_or_else(|| {

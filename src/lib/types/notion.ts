@@ -11,6 +11,7 @@ export interface NotionConfigInput {
 export interface NotionConfig extends Omit<NotionConfigInput, 'token'> {
 	hasToken: boolean;
 	tokenSource: NotionTokenSource;
+	tokenEnvVarName?: string;
 }
 
 export interface NotionDatabaseSetupInput {

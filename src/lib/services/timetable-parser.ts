@@ -1,5 +1,13 @@
 import { GlobalWorkerOptions, getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs';
-import { DAY_LABELS, type DayLabel, type ImportPreview, type LessonOccurrence, type ParseIssue, type ParsedLesson } from '$lib/types/timetable';
+import {
+	DAY_LABELS,
+	type DayLabel,
+	type ImportPreview,
+	type LessonOccurrence,
+	type ParseIssue,
+	type ParsedLesson,
+	type UnparsedLessonCandidate
+} from '$lib/types/timetable';
 import { ensurePdfJsWebViewCompatibility } from './webview-compat';
 
 interface PositionedText {
@@ -17,6 +25,11 @@ interface DayRange {
 	day: DayLabel;
 	minX: number;
 	maxX: number;
+}
+
+interface ParseLessonsResult {
+	lessons: ParsedLesson[];
+	missedCandidates: UnparsedLessonCandidate[];
 }
 
 const COURSE_CODE_PATTERN = /([A-Z]{3}\d{4})/;
@@ -248,6 +261,59 @@ function extractWeekData(lines: string[]): { weeks: number[]; consumedIndexes: n
 	return { weeks: parseWeekExpression(match[1]), consumedIndexes: [] };
 }
 
+function extractTimeRange(lines: string[]): { startTime?: string; endTime?: string; lineIndex?: number } {
+	for (let index = 0; index < lines.length; index += 1) {
+		const match = lines[index].match(TIME_RANGE_PATTERN);
+		if (!match) {
+			continue;
+		}
+		return {
+			startTime: normalizeTimeText(match[1]),
+			endTime: normalizeTimeText(match[2]),
+			lineIndex: index
+		};
+	}
+	return {};
+}
+
+function buildUnparsedCandidate(
+	blockItems: PositionedText[],
+	day: DayLabel,
+	fallbackId: string
+): UnparsedLessonCandidate | undefined {
+	const lines = buildBlockLines(blockItems);
+	if (lines.length === 0) {
+		return undefined;
+	}
+
+	const timeRange = extractTimeRange(lines);
+	const { weeks } = extractWeekData(lines);
+	if (!timeRange.startTime || !timeRange.endTime || weeks.length === 0) {
+		return undefined;
+	}
+
+	const joined = lines.join(' | ');
+	const courseCode = lines
+		.map((line) => parseCourseCode(line))
+		.find((value): value is string => Boolean(value));
+
+	return {
+		id: fallbackId,
+		day,
+		sourceText: joined,
+		startTime: timeRange.startTime,
+		endTime: timeRange.endTime,
+		weeks,
+		courseCode,
+		issues: [
+			{
+				code: 'missed_candidate_recovery',
+				message: 'Deterministic parser flagged this block for LLM missed-lesson recovery.'
+			}
+		]
+	};
+}
+
 function cleanInstructorLine(value: string): { cleaned: string; removedFragment: boolean } {
 	const normalized = normalizeText(value);
 	if (!normalized) {
@@ -294,23 +360,13 @@ function parseLessonFromBlock(
 		return undefined;
 	}
 
-	let timeMatch = courseLine.match(TIME_RANGE_PATTERN);
-	let timeLineIndex = courseLineIndex;
-	if (!timeMatch) {
-		for (let index = 0; index < lines.length; index += 1) {
-			const match = lines[index].match(TIME_RANGE_PATTERN);
-			if (match) {
-				timeMatch = match;
-				timeLineIndex = index;
-				break;
-			}
-		}
-	}
-	if (!timeMatch) {
+	const timeRange = extractTimeRange(lines);
+	if (!timeRange.startTime || !timeRange.endTime || timeRange.lineIndex === undefined) {
 		return undefined;
 	}
-	const startTime = normalizeTimeText(timeMatch[1]);
-	const endTime = normalizeTimeText(timeMatch[2]);
+	const startTime = timeRange.startTime;
+	const endTime = timeRange.endTime;
+	const timeLineIndex = timeRange.lineIndex;
 
 	const { weeks, consumedIndexes: consumedWeekIndexes } = extractWeekData(lines);
 	if (weeks.length === 0) {
@@ -481,7 +537,39 @@ function expandLessonsToOccurrences(lessons: ParsedLesson[], startWeekDate: stri
 	});
 }
 
-export function parseLessonsFromPositionedText(items: PositionedText[]): ParsedLesson[] {
+function isAnchorSignal(text: string): boolean {
+	return Boolean(parseCourseCode(text)) || TIME_RANGE_PATTERN.test(text) || /W\s*k/i.test(text);
+}
+
+function anchorPriority(text: string): number {
+	if (parseCourseCode(text)) {
+		return 3;
+	}
+	if (TIME_RANGE_PATTERN.test(text)) {
+		return 2;
+	}
+	if (/W\s*k/i.test(text)) {
+		return 1;
+	}
+	return 0;
+}
+
+function missedCandidateKey(candidate: UnparsedLessonCandidate): string {
+	return [
+		candidate.day,
+		candidate.startTime ?? '',
+		candidate.endTime ?? '',
+		candidate.courseCode ?? '',
+		candidate.weeks.join(','),
+		candidate.sourceText
+	].join('|');
+}
+
+function lessonParseKey(lesson: ParsedLesson): string {
+	return `${lesson.day}|${lesson.startTime}|${lesson.endTime}|${lesson.courseCode}|${lesson.weeks.join(',')}`;
+}
+
+function parseLessonsWithCandidatesFromPositionedText(items: PositionedText[]): ParseLessonsResult {
 	const dayAnchors = collectDayAnchors(items);
 	if (dayAnchors.length === 0) {
 		throw new Error('Could not find weekday headers in the timetable PDF.');
@@ -490,19 +578,21 @@ export function parseLessonsFromPositionedText(items: PositionedText[]): ParsedL
 	const dayRanges = buildDayRanges(dayAnchors);
 	const contentItems = items.filter((item) => item.y < 700);
 	const blockCandidates = contentItems
-		.filter((item) => parseCourseCode(item.text))
+		.filter((item) => isAnchorSignal(item.text))
 		.map((item) => ({ ...item, day: findDayByX(item.x, dayRanges) }))
 		.filter((item): item is PositionedText & { day: DayLabel } => Boolean(item.day));
 
-	const dedup = new Map<string, PositionedText & { day: DayLabel }>();
+	const dedup = new Map<string, PositionedText & { day: DayLabel; priority: number }>();
 	for (const candidate of blockCandidates) {
-		const key = `${candidate.day}:${Math.round(candidate.y * 2) / 2}:${parseCourseCode(candidate.text)}`;
-		if (!dedup.has(key)) {
-			dedup.set(key, candidate);
+		const key = `${candidate.day}:${Math.round(candidate.y * 2) / 2}`;
+		const priority = anchorPriority(candidate.text);
+		const existing = dedup.get(key);
+		if (!existing || priority > existing.priority) {
+			dedup.set(key, { ...candidate, priority });
 		}
 	}
 
-	const groups = new Map<DayLabel, (PositionedText & { day: DayLabel })[]>();
+	const groups = new Map<DayLabel, (PositionedText & { day: DayLabel; priority: number })[]>();
 	for (const candidate of dedup.values()) {
 		const list = groups.get(candidate.day) ?? [];
 		list.push(candidate);
@@ -510,13 +600,11 @@ export function parseLessonsFromPositionedText(items: PositionedText[]): ParsedL
 	}
 
 	const lessons: ParsedLesson[] = [];
+	const missedCandidates: UnparsedLessonCandidate[] = [];
 	for (const day of DAY_LABELS) {
 		const dayCandidates = groups.get(day);
-		if (!dayCandidates || dayCandidates.length === 0) {
-			continue;
-		}
 		const dayRange = dayRanges.find((range) => range.day === day);
-		if (!dayRange) {
+		if (!dayRange || !dayCandidates) {
 			continue;
 		}
 
@@ -528,26 +616,67 @@ export function parseLessonsFromPositionedText(items: PositionedText[]): ParsedL
 		for (let index = 0; index < sortedCandidates.length; index += 1) {
 			const candidate = sortedCandidates[index];
 			const next = sortedCandidates[index + 1];
-			const lowerBoundary = next ? next.y + 1.5 : -Infinity;
+			const lowerBoundary =
+				next && candidate.y - next.y > 55 ? next.y + 1.5 : -Infinity;
 			const blockItems = dayItems.filter(
-				(item) => item.y <= candidate.y + 0.5 && item.y > lowerBoundary && item.y >= candidate.y - 130
+				(item) => item.y <= candidate.y + 4 && item.y > lowerBoundary && item.y >= candidate.y - 145
 			);
-			const lessonId = `${candidate.day}-${Math.round(candidate.y)}-${parseCourseCode(candidate.text)}`;
+			const lessonId = `${candidate.day}-${Math.round(candidate.y)}-${parseCourseCode(candidate.text) ?? 'candidate'}`;
 			const parsed = parseLessonFromBlock(blockItems, day, lessonId);
 			if (parsed) {
 				lessons.push(parsed);
+				continue;
+			}
+			const unresolved = buildUnparsedCandidate(blockItems, day, lessonId);
+			if (unresolved) {
+				missedCandidates.push(unresolved);
+			}
+		}
+
+		// Second-pass day scan for missed blocks: time + week signals in unresolved windows.
+		const timeAnchors = dayItems.filter((item) => TIME_RANGE_PATTERN.test(item.text));
+		for (const anchor of timeAnchors) {
+			const blockItems = dayItems.filter((item) => item.y <= anchor.y + 44 && item.y >= anchor.y - 96);
+			const parsed = parseLessonFromBlock(blockItems, day, `${day}-${Math.round(anchor.y)}-scan`);
+			if (parsed) {
+				continue;
+			}
+			const unresolved = buildUnparsedCandidate(
+				blockItems,
+				day,
+				`${day}-${Math.round(anchor.y)}-scan`
+			);
+			if (unresolved) {
+				missedCandidates.push(unresolved);
 			}
 		}
 	}
 
 	const unique = new Map<string, ParsedLesson>();
 	for (const lesson of lessons) {
-		const key = `${lesson.day}|${lesson.startTime}|${lesson.endTime}|${lesson.courseCode}|${lesson.weeks.join(',')}`;
+		const key = lessonParseKey(lesson);
 		if (!unique.has(key)) {
 			unique.set(key, lesson);
 		}
 	}
-	return sortLessons([...unique.values()]);
+
+	const uniqueMissed = new Map<string, UnparsedLessonCandidate>();
+	for (const candidate of missedCandidates) {
+		const lessonKey = `${candidate.day}|${candidate.startTime ?? ''}|${candidate.endTime ?? ''}|${candidate.courseCode ?? ''}|${candidate.weeks.join(',')}`;
+		if (unique.has(lessonKey)) {
+			continue;
+		}
+		const key = missedCandidateKey(candidate);
+		if (!uniqueMissed.has(key)) {
+			uniqueMissed.set(key, candidate);
+		}
+	}
+
+	return { lessons: sortLessons([...unique.values()]), missedCandidates: [...uniqueMissed.values()] };
+}
+
+export function parseLessonsFromPositionedText(items: PositionedText[]): ParsedLesson[] {
+	return parseLessonsWithCandidatesFromPositionedText(items).lessons;
 }
 
 async function extractPositionedTextFromPdfBytes(data: Uint8Array): Promise<PositionedText[]> {
@@ -593,8 +722,21 @@ export function rebuildPreviewFromLessons(lessons: ParsedLesson[], startWeekDate
 }
 
 function buildImportPreview(positionedItems: PositionedText[], startWeekDate: string): ImportPreview {
-	const lessons = parseLessonsFromPositionedText(positionedItems);
-	return rebuildPreviewFromLessons(lessons, startWeekDate);
+	const parsed = parseLessonsWithCandidatesFromPositionedText(positionedItems);
+	if (parsed.lessons.length === 0) {
+		return {
+			lessons: [],
+			occurrences: [],
+			minWeek: 0,
+			maxWeek: 0,
+			missedCandidates: parsed.missedCandidates
+		};
+	}
+	const preview = rebuildPreviewFromLessons(parsed.lessons, startWeekDate);
+	return {
+		...preview,
+		missedCandidates: parsed.missedCandidates
+	};
 }
 
 export async function parseTimetablePdfBytes(data: Uint8Array, startWeekDate: string): Promise<ImportPreview> {
@@ -611,5 +753,6 @@ export const __testables = {
 	parseWeekExpression,
 	parseWeekLine,
 	parseLessonsFromPositionedText,
+	parseLessonsWithCandidatesFromPositionedText,
 	expandLessonsToOccurrences
 };

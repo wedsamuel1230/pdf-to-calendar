@@ -26,22 +26,24 @@ function loadLocalConfig(): NotionConfig {
 	if (!isBrowser) {
 		return {
 			databaseIdOrUrl: DEFAULT_DATABASE_ID_OR_URL,
-			datePropertyName: 'Start Time',
+			datePropertyName: 'Time',
 			titlePropertyName: 'Class/Event',
 			timezone: 'Asia/Hong_Kong',
 			hasToken: false,
-			tokenSource: 'none'
+			tokenSource: 'none',
+			tokenEnvVarName: undefined
 		};
 	}
 	const raw = window.localStorage.getItem(LOCAL_CONFIG_KEY);
 	if (!raw) {
 		return {
 			databaseIdOrUrl: DEFAULT_DATABASE_ID_OR_URL,
-			datePropertyName: 'Start Time',
+			datePropertyName: 'Time',
 			titlePropertyName: 'Class/Event',
 			timezone: 'Asia/Hong_Kong',
 			hasToken: false,
-			tokenSource: 'none'
+			tokenSource: 'none',
+			tokenEnvVarName: undefined
 		};
 	}
 
@@ -49,18 +51,20 @@ function loadLocalConfig(): NotionConfig {
 		const parsed = JSON.parse(raw) as NotionConfig;
 		return {
 			...parsed,
-			titlePropertyName: parsed.titlePropertyName === 'Name' ? 'Class/Event' : parsed.titlePropertyName,
-			datePropertyName: parsed.datePropertyName === 'Date' ? 'Start Time' : parsed.datePropertyName,
-			tokenSource: parsed.tokenSource ?? 'none'
+			titlePropertyName: 'Class/Event',
+			datePropertyName: 'Time',
+			tokenSource: parsed.tokenSource ?? 'none',
+			tokenEnvVarName: parsed.tokenEnvVarName
 		};
 	} catch {
 		return {
 			databaseIdOrUrl: DEFAULT_DATABASE_ID_OR_URL,
-			datePropertyName: 'Start Time',
+			datePropertyName: 'Time',
 			titlePropertyName: 'Class/Event',
 			timezone: 'Asia/Hong_Kong',
 			hasToken: false,
-			tokenSource: 'none'
+			tokenSource: 'none',
+			tokenEnvVarName: undefined
 		};
 	}
 }
@@ -68,11 +72,12 @@ function loadLocalConfig(): NotionConfig {
 function saveLocalConfig(value: NotionConfigInput): NotionConfig {
 	const config: NotionConfig = {
 		databaseIdOrUrl: value.databaseIdOrUrl,
-		datePropertyName: value.datePropertyName,
-		titlePropertyName: value.titlePropertyName,
+		datePropertyName: 'Time',
+		titlePropertyName: 'Class/Event',
 		timezone: value.timezone,
 		hasToken: Boolean(value.token),
-		tokenSource: value.token ? 'keychain' : 'none'
+		tokenSource: value.token ? 'keychain' : 'none',
+		tokenEnvVarName: undefined
 	};
 	if (isBrowser) {
 		window.localStorage.setItem(LOCAL_CONFIG_KEY, JSON.stringify(config));

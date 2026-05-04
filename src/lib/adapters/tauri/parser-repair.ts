@@ -13,6 +13,13 @@ function isTauriRuntime(): boolean {
 	return Boolean(isBrowser && window.__TAURI_INTERNALS__);
 }
 
+const FALLBACK_MODELS = [
+	'meta/llama-3.1-70b-instruct',
+	'mistralai/mixtral-8x7b-instruct-v0.1',
+	'meta/llama-3.1-8b-instruct',
+	'google/gemma-2-9b-it'
+] as const;
+
 export interface NvidiaModelStatus {
 	hasApiKey: boolean;
 	sourceEnvVar?: string;
@@ -23,7 +30,7 @@ export interface NvidiaModelStatus {
 
 export async function listNvidiaModels(): Promise<string[]> {
 	if (!isTauriRuntime()) {
-		return [];
+		return [...FALLBACK_MODELS];
 	}
 	return invoke<string[]>('list_nvidia_models');
 }
@@ -32,7 +39,7 @@ export async function getNvidiaModelStatus(): Promise<NvidiaModelStatus> {
 	if (!isTauriRuntime()) {
 		return {
 			hasApiKey: false,
-			models: [],
+			models: [...FALLBACK_MODELS],
 			usedFallback: true,
 			apiError: 'Browser mode: NVIDIA model API is only available in Tauri runtime.'
 		};
@@ -48,4 +55,16 @@ export async function repairLessonsWithLlm(
 		return lessons;
 	}
 	return invoke<ParsedLesson[]>('repair_lessons_with_llm', { input: { lessons, model } });
+}
+
+export async function extractLessonsWithLlm(
+	candidates: ParsedLesson[],
+	model?: string
+): Promise<ParsedLesson[]> {
+	if (!isTauriRuntime() || candidates.length === 0) {
+		return [];
+	}
+	return invoke<ParsedLesson[]>('extract_lessons_with_llm', {
+		input: { lessons: candidates, model, mode: 'extract' }
+	});
 }

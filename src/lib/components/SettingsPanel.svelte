@@ -5,6 +5,7 @@
 	interface Props {
 		form: NotionConfigInput;
 		tokenSource: NotionTokenSource;
+		tokenEnvVarName?: string;
 		parentPageIdOrUrl: string;
 		databaseName: string;
 		busy?: boolean;
@@ -20,6 +21,7 @@
 	let {
 		form,
 		tokenSource,
+		tokenEnvVarName = undefined,
 		parentPageIdOrUrl,
 		databaseName,
 		busy = false,
@@ -38,7 +40,7 @@
 
 	function tokenSourceLabel(value: NotionTokenSource): string {
 		if (value === 'environment') {
-			return 'Environment variable (NOTION_TOKEN)';
+			return `Environment variable${tokenEnvVarName ? ` (${tokenEnvVarName})` : ''}`;
 		}
 		if (value === 'keychain') {
 			return 'Saved keychain token';
@@ -64,6 +66,14 @@
 			<div class="token-status">
 				<span class="label-row">Token Source</span>
 				<p class="token-value">{tokenSourceLabel(tokenSource)}</p>
+				{#if tokenSource === 'none'}
+					<div class="env-help text-muted">
+						<p>Set `NOTION_TOKEN` then restart the app.</p>
+						<p>macOS/Linux: `export NOTION_TOKEN=\"your_token\"`</p>
+						<p>Windows PowerShell: `$env:NOTION_TOKEN=\"your_token\"`</p>
+						<p>Persist on Windows: `setx NOTION_TOKEN \"your_token\"`</p>
+					</div>
+				{/if}
 			</div>
 
 			<label>
@@ -106,27 +116,10 @@
 			</div>
 
 			<div class="row">
-				<label>
-					<span class="label-row">Title Property</span>
-					<input
-						class="control"
-						type="text"
-						value={form.titlePropertyName}
-						oninput={(event) =>
-							patch({ titlePropertyName: (event.currentTarget as HTMLInputElement).value })}
-					/>
-				</label>
-
-				<label>
-					<span class="label-row">Date Property</span>
-					<input
-						class="control"
-						type="text"
-						value={form.datePropertyName}
-						oninput={(event) =>
-							patch({ datePropertyName: (event.currentTarget as HTMLInputElement).value })}
-					/>
-				</label>
+				<div class="schema-lock">
+					<span class="label-row">Locked Schema</span>
+					<p class="token-value">Class/Event, Day, Time, Location, Instructor</p>
+				</div>
 
 				<label>
 					<span class="label-row">Timezone</span>
@@ -197,7 +190,7 @@
 
 	.row {
 		display: grid;
-		grid-template-columns: repeat(3, minmax(0, 1fr));
+		grid-template-columns: repeat(2, minmax(0, 1fr));
 		gap: 10px;
 	}
 
@@ -217,6 +210,15 @@
 		color: var(--color-polar-white);
 		font-family: var(--font-mono);
 		font-size: 14px;
+	}
+
+	.env-help p {
+		margin: 0;
+	}
+
+	.schema-lock {
+		display: grid;
+		gap: 6px;
 	}
 
 	p.status {

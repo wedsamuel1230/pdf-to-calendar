@@ -32,3 +32,16 @@ pub async fn repair_lessons_with_llm(
         .map(|result| result.lessons)
         .map_err(|error| error.message)
 }
+
+#[tauri::command]
+pub async fn extract_lessons_with_llm(
+    app: AppHandle,
+    mut input: RepairLessonsInput,
+) -> Result<Vec<ParsedLessonForRepair>, String> {
+    input.mode = Some("extract".to_string());
+    ParserRepairService::new(app)
+        .repair_lessons(input)
+        .await
+        .map(|result| result.lessons)
+        .map_err(|error| error.message)
+}

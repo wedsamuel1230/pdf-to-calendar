@@ -22,6 +22,23 @@ const NVIDIA_FALLBACK_MODELS: [&str; 4] = [
     "google/gemma-2-9b-it",
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LlmMode {
+    Repair,
+    Extract,
+}
+
+impl LlmMode {
+    fn from_input(value: Option<&str>) -> Self {
+        if let Some(mode) = value {
+            if mode.trim().eq_ignore_ascii_case("extract") {
+                return Self::Extract;
+            }
+        }
+        Self::Repair
+    }
+}
+
 #[derive(Debug, Clone)]
 struct NvidiaApiKey {
     value: String,
@@ -153,10 +170,15 @@ impl ParserRepairService {
         &self,
         input: RepairLessonsInput,
     ) -> Result<RepairLessonResult, AppError> {
+        let mode = LlmMode::from_input(input.mode.as_deref());
         let token = load_nvidia_api_key();
         if token.is_none() || input.lessons.is_empty() {
             return Ok(RepairLessonResult {
-                lessons: input.lessons,
+                lessons: if mode == LlmMode::Extract {
+                    vec![]
+                } else {
+                    input.lessons
+                },
             });
         }
         let token = token.map(|item| item.value).unwrap_or_default();
@@ -170,7 +192,10 @@ impl ParserRepairService {
             self.pick_default_model().await?
         };
 
-        let prompt = build_repair_prompt(&input.lessons);
+        let prompt = match mode {
+            LlmMode::Repair => build_repair_prompt(&input.lessons),
+            LlmMode::Extract => build_extract_prompt(&input.lessons),
+        };
         let url = format!("{}/chat/completions", nvidia_base_url());
         let payload = json!({
             "model": model,
@@ -202,9 +227,17 @@ impl ParserRepairService {
         let array_text = extract_json_array_text(&content).unwrap_or_else(|| "[]".to_string());
         let parsed: Vec<ParsedLessonForRepair> =
             serde_json::from_str(&array_text).unwrap_or_default();
+        let parsed = parsed
+            .into_iter()
+            .filter(is_valid_llm_lesson)
+            .collect::<Vec<_>>();
         if parsed.is_empty() {
             return Ok(RepairLessonResult {
-                lessons: input.lessons,
+                lessons: if mode == LlmMode::Extract {
+                    vec![]
+                } else {
+                    input.lessons
+                },
             });
         }
         Ok(RepairLessonResult { lessons: parsed })
@@ -234,6 +267,15 @@ fn build_repair_prompt(lessons: &[ParsedLessonForRepair]) -> String {
     )
 }
 
+fn build_extract_prompt(candidates: &[ParsedLessonForRepair]) -> String {
+    let json_candidates =
+        serde_json::to_string_pretty(candidates).unwrap_or_else(|_| "[]".to_string());
+    format!(
+        "You are recovering missed timetable lessons from parser candidates.\nReturn strict JSON array only with complete lesson objects.\nRules:\n- Keep ids from input candidates.\n- Extract day/start_time/end_time/weeks/course_code/title from source_text.\n- Normalize start_time/end_time as HH:MM (24h).\n- weeks must be positive integers.\n- Keep confidence between 0.0 and 1.0 and provide issues.\nInput candidates:\n{}",
+        json_candidates
+    )
+}
+
 fn extract_json_array_text(content: &str) -> Option<String> {
     let start = content.find('[')?;
     let end = content.rfind(']')?;
@@ -241,6 +283,34 @@ fn extract_json_array_text(content: &str) -> Option<String> {
         return None;
     }
     Some(content[start..=end].to_string())
+}
+
+fn is_valid_llm_lesson(lesson: &ParsedLessonForRepair) -> bool {
+    if lesson.id.trim().is_empty()
+        || lesson.title.trim().is_empty()
+        || lesson.course_code.trim().is_empty()
+        || lesson.day.trim().is_empty()
+        || !is_hhmm(&lesson.start_time)
+        || !is_hhmm(&lesson.end_time)
+        || lesson.weeks.is_empty()
+    {
+        return false;
+    }
+
+    lesson.weeks.iter().all(|week| *week > 0)
+}
+
+fn is_hhmm(value: &str) -> bool {
+    let parts = value.split(':').collect::<Vec<_>>();
+    if parts.len() != 2 {
+        return false;
+    }
+    let hour = parts[0].parse::<u32>().ok();
+    let minute = parts[1].parse::<u32>().ok();
+    match (hour, minute) {
+        (Some(h), Some(m)) => h <= 23 && m <= 59,
+        _ => false,
+    }
 }
 
 fn load_nvidia_api_key() -> Option<NvidiaApiKey> {

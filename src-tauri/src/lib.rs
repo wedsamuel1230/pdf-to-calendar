@@ -26,7 +26,8 @@ pub fn run() {
             commands::notion_commands::import_lessons,
             commands::parser_commands::list_nvidia_models,
             commands::parser_commands::get_nvidia_model_status,
-            commands::parser_commands::repair_lessons_with_llm
+            commands::parser_commands::repair_lessons_with_llm,
+            commands::parser_commands::extract_lessons_with_llm
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -23,14 +23,21 @@
 		parseTimetablePdfBytes,
 		rebuildPreviewFromLessons
 	} from '$lib/services/timetable-parser';
+	import { applyCourseNameMapping } from '$lib/services/course-name-mapping';
 	import {
 		getNvidiaModelStatus,
-		listNvidiaModels,
+		extractLessonsWithLlm,
 		repairLessonsWithLlm
 	} from '$lib/adapters/tauri/parser-repair';
 	import { appMessage, appStep } from '$lib/stores/import-state';
 	import type { NotionConfigInput, NotionTokenSource } from '$lib/types/notion';
-	import type { ImportPreview, ImportResult, LessonOccurrence, ParsedLesson } from '$lib/types/timetable';
+	import type {
+		ImportPreview,
+		ImportResult,
+		LessonOccurrence,
+		ParsedLesson,
+		UnparsedLessonCandidate
+	} from '$lib/types/timetable';
 
 	let selectedFile = $state<File | null>(null);
 	let selectedNativePath = $state('');
@@ -45,15 +52,19 @@
 	let busy = $state(false);
 	let importProgress = $state(0);
 	let tokenSource = $state<NotionTokenSource>('none');
+	let tokenEnvVarName = $state<string | undefined>(undefined);
 	let llmRepairEnabled = $state(false);
 	let nvidiaModels = $state<string[]>([]);
 	let selectedNvidiaModel = $state('');
 	let nvidiaModelOverride = $state('');
 	let nvidiaStatus = $state('');
+	let nvidiaHasApiKey = $state(false);
+	let courseCodeInput = $state('');
+	let fullCourseNameInput = $state('');
 
 	let notionForm = $state<NotionConfigInput>({
 		databaseIdOrUrl: '',
-		datePropertyName: 'Start Time',
+		datePropertyName: 'Time',
 		titlePropertyName: 'Class/Event',
 		timezone: 'Asia/Hong_Kong'
 	});
@@ -64,18 +75,20 @@
 		const config = await loadNotionConfig();
 		notionForm = {
 			databaseIdOrUrl: config.databaseIdOrUrl,
-			datePropertyName: config.datePropertyName,
-			titlePropertyName: config.titlePropertyName,
+			datePropertyName: 'Time',
+			titlePropertyName: 'Class/Event',
 			timezone: config.timezone
 		};
 		tokenSource = config.tokenSource;
-		settingsStatus = tokenSourceStatus(config.tokenSource);
+		tokenEnvVarName = config.tokenEnvVarName;
+		settingsStatus = tokenSourceStatus(config.tokenSource, config.tokenEnvVarName);
 		await refreshNvidiaModels();
 	});
 
 	async function refreshNvidiaModels(): Promise<void> {
 		const status = await getNvidiaModelStatus();
-		nvidiaModels = status.models;
+		nvidiaHasApiKey = status.hasApiKey;
+		nvidiaModels = status.models.length > 0 ? status.models : ['meta/llama-3.1-70b-instruct'];
 		if (!selectedNvidiaModel && nvidiaModels.length > 0) {
 			selectedNvidiaModel = nvidiaModels[0];
 		}
@@ -87,14 +100,22 @@
 				: `Loaded models from NVIDIA API${source}.`;
 	}
 
-	function tokenSourceStatus(source: NotionTokenSource): string {
+	function tokenSourceStatus(source: NotionTokenSource, envVarName?: string): string {
 		if (source === 'environment') {
-			return 'Using NOTION_TOKEN from the environment.';
+			return `Using environment token${envVarName ? ` (${envVarName})` : ''}.`;
 		}
 		if (source === 'keychain') {
 			return 'Using a saved keychain token.';
 		}
 		return 'No token configured. Set NOTION_TOKEN or save a token in app settings first.';
+	}
+
+	function lockedNotionConfig(value: NotionConfigInput): NotionConfigInput {
+		return {
+			...value,
+			titlePropertyName: 'Class/Event',
+			datePropertyName: 'Time'
+		};
 	}
 
 	function resetTransientMessages(): void {
@@ -165,18 +186,40 @@
 				}
 			}
 			preview = await parseTimetablePdfBytes(data, weekDate);
-			if (llmRepairEnabled) {
-				const lowConfidence = preview.lessons.filter((item) => (item.confidence ?? 1) < 0.7);
-				if (lowConfidence.length > 0) {
-					const model = nvidiaModelOverride.trim() || selectedNvidiaModel || undefined;
-					const repaired = await repairLessonsWithLlm(lowConfidence, model);
-					const merged = mergeRepairedLessons(preview.lessons, repaired);
-					preview = rebuildPreviewFromLessons(merged, weekDate);
+			let mergedLessons = [...preview.lessons];
+			const model = nvidiaModelOverride.trim() || selectedNvidiaModel || undefined;
+			const unresolvedCount = preview.missedCandidates?.length ?? 0;
+
+			if (llmRepairEnabled && nvidiaHasApiKey) {
+				const candidates = preview.missedCandidates ?? [];
+				if (candidates.length > 0) {
+					appMessage.set(`Recovering ${candidates.length} unresolved lesson blocks with NVIDIA LLM...`);
+					const recovered = await extractLessonsWithLlm(candidatesToLessons(candidates), model);
+					mergedLessons = mergeRecoveredLessons(mergedLessons, recovered);
 				}
+
+				const lowConfidence = mergedLessons.filter((item) => (item.confidence ?? 1) < 0.7);
+				if (lowConfidence.length > 0) {
+					const repaired = await repairLessonsWithLlm(lowConfidence, model);
+					mergedLessons = mergeRepairedLessons(mergedLessons, repaired);
+				}
+			} else if (llmRepairEnabled && !nvidiaHasApiKey) {
+				appMessage.set('LLM recovery is enabled, but NVIDIA API key was not detected. Parsed with deterministic mode only.');
 			}
+
+			if (mergedLessons.length === 0) {
+				if (unresolvedCount > 0) {
+					throw new Error(
+						`No lessons were parsed. ${unresolvedCount} unresolved lesson candidates were detected. Enable LLM recovery with NVIDIA API key for fallback extraction.`
+					);
+				}
+				throw new Error('No lessons were detected from this PDF. Please review the timetable format.');
+			}
+
+			preview = rebuildPreviewFromLessons(mergedLessons, weekDate);
 			reviewOccurrences = [...preview.occurrences];
-			const lowConfidenceCount = preview.lessons.filter((item) => (item.confidence ?? 1) < 0.7).length;
-			parseSummary = `Parsed ${preview.lessons.length} lessons and ${preview.occurrences.length} event occurrences (Wk:${preview.minWeek}-${preview.maxWeek}). ${lowConfidenceCount} low-confidence lessons.`;
+			const lowConfidenceCount = mergedLessons.filter((item) => (item.confidence ?? 1) < 0.7).length;
+			parseSummary = `Parsed ${mergedLessons.length} lessons and ${preview.occurrences.length} event occurrences (Wk:${preview.minWeek}-${preview.maxWeek}). ${lowConfidenceCount} low-confidence lessons.`;
 			appStep.set('review');
 			appMessage.set('Ready for review.');
 		} catch (error) {
@@ -199,10 +242,11 @@
 
 	async function handleSaveSettings(): Promise<void> {
 		try {
-			const parsed = notionConfigSchema.parse(notionForm);
+			const parsed = notionConfigSchema.parse(lockedNotionConfig(notionForm));
 			const saved = await saveNotionConfig(parsed);
 			tokenSource = saved.tokenSource;
-			settingsStatus = `Settings saved. ${tokenSourceStatus(saved.tokenSource)}`;
+			tokenEnvVarName = saved.tokenEnvVarName;
+			settingsStatus = `Settings saved. ${tokenSourceStatus(saved.tokenSource, saved.tokenEnvVarName)}`;
 		} catch (error) {
 			settingsStatus = error instanceof Error ? error.message : 'Unable to save settings.';
 		}
@@ -210,7 +254,7 @@
 
 	async function handleTestConnection(): Promise<void> {
 		try {
-			const parsed = notionConfigSchema.parse(notionForm);
+			const parsed = notionConfigSchema.parse(lockedNotionConfig(notionForm));
 			const response = await testNotionConnection(parsed);
 			settingsStatus = response.message;
 		} catch (error) {
@@ -223,16 +267,16 @@
 			const parsed = notionDatabaseSetupSchema.parse({
 				parentPageIdOrUrl,
 				databaseName,
-				datePropertyName: notionForm.datePropertyName,
-				titlePropertyName: notionForm.titlePropertyName,
+				datePropertyName: 'Time',
+				titlePropertyName: 'Class/Event',
 				timezone: notionForm.timezone
 			});
 			const created = await createNotionCalendarDatabase(parsed);
 			notionForm = {
 				...notionForm,
 				databaseIdOrUrl: created.databaseUrl,
-				datePropertyName: created.datePropertyName,
-				titlePropertyName: created.titlePropertyName,
+				datePropertyName: 'Time',
+				titlePropertyName: 'Class/Event',
 				timezone: created.timezone
 			};
 			settingsStatus = created.message;
@@ -247,7 +291,7 @@
 			if (reviewOccurrences.length === 0) {
 				throw new Error('No occurrences to import.');
 			}
-			const parsedConfig = notionConfigSchema.parse(notionForm);
+			const parsedConfig = notionConfigSchema.parse(lockedNotionConfig(notionForm));
 			await saveNotionConfig(parsedConfig);
 			for (const occurrence of reviewOccurrences) {
 				lessonOccurrenceSchema.parse(occurrence);
@@ -269,9 +313,95 @@
 		}
 	}
 
+	function parseWeekNumbers(sourceText: string): number[] {
+		const match = sourceText.match(/W\s*k\s*:?\s*([0-9,\-\s]+)/i);
+		if (!match) {
+			return [];
+		}
+		const tokens = match[1]
+			.split(',')
+			.map((item) => item.trim())
+			.filter(Boolean);
+		const weeks = new Set<number>();
+		for (const token of tokens) {
+			const range = token.match(/^(\d+)\s*-\s*(\d+)$/);
+			if (range) {
+				const start = Number(range[1]);
+				const end = Number(range[2]);
+				if (Number.isFinite(start) && Number.isFinite(end)) {
+					const [from, to] = start <= end ? [start, end] : [end, start];
+					for (let week = from; week <= to; week += 1) {
+						weeks.add(week);
+					}
+				}
+				continue;
+			}
+			const numeric = Number(token);
+			if (Number.isFinite(numeric)) {
+				weeks.add(numeric);
+			}
+		}
+		return [...weeks].sort((a, b) => a - b);
+	}
+
+	function candidatesToLessons(candidates: UnparsedLessonCandidate[]): ParsedLesson[] {
+		return candidates.map((candidate) => ({
+			id: candidate.id,
+			title: candidate.courseCode ?? 'RECOVERY_CANDIDATE',
+			courseCode: candidate.courseCode ?? 'RECOVERY0000',
+			day: candidate.day,
+			startTime: candidate.startTime ?? '00:00',
+			endTime: candidate.endTime ?? '00:00',
+			weeks: candidate.weeks.length > 0 ? candidate.weeks : parseWeekNumbers(candidate.sourceText),
+			sourceText: candidate.sourceText,
+			confidence: 0.2,
+			issues: candidate.issues
+		}));
+	}
+
+	function lessonDedupKey(item: ParsedLesson): string {
+		return [
+			item.day,
+			item.startTime,
+			item.endTime,
+			(item.courseCode || item.title).trim().toUpperCase(),
+			item.weeks.join(',')
+		].join('|');
+	}
+
+	function mergeRecoveredLessons(original: ParsedLesson[], recovered: ParsedLesson[]): ParsedLesson[] {
+		const merged = [...original];
+		const keys = new Set(original.map(lessonDedupKey));
+		for (const lesson of recovered) {
+			const key = lessonDedupKey(lesson);
+			if (keys.has(key)) {
+				continue;
+			}
+			keys.add(key);
+			merged.push({ ...lesson, repairedByLlm: true });
+		}
+		return merged;
+	}
+
 	function mergeRepairedLessons(original: ParsedLesson[], repaired: ParsedLesson[]): ParsedLesson[] {
 		const byId = new Map(repaired.map((item) => [item.id, item]));
 		return original.map((item) => byId.get(item.id) ?? item);
+	}
+
+	function handleApplyCourseName(): void {
+		const courseCode = courseCodeInput.trim().toUpperCase();
+		const fullName = fullCourseNameInput.trim();
+		if (!courseCode || !fullName) {
+			errorText = 'Provide both Course Code and Full Course Name.';
+			return;
+		}
+
+		const mapped = applyCourseNameMapping(reviewOccurrences, courseCode, fullName);
+		reviewOccurrences = mapped.updated;
+		parseSummary =
+			mapped.changed > 0
+				? `Applied full course name to ${mapped.changed} occurrences.`
+				: `No rows matched ${courseCode}.`;
 	}
 </script>
 
@@ -301,12 +431,13 @@
 		<SettingsPanel
 			form={notionForm}
 			tokenSource={tokenSource}
+			tokenEnvVarName={tokenEnvVarName}
 			parentPageIdOrUrl={parentPageIdOrUrl}
 			databaseName={databaseName}
 			busy={busy}
 			status={settingsStatus}
 			onFormChange={(next) => {
-				notionForm = next;
+				notionForm = lockedNotionConfig(next);
 			}}
 			onParentPageChange={(value) => {
 				parentPageIdOrUrl = value;
@@ -363,6 +494,17 @@
 				{/if}
 				Parse Timetable
 			</button>
+			<div class="course-map panel">
+				<h3 class="panel-title">Bulk Course Name Mapping</h3>
+				<p class="text-muted">Session-only override for all rows matching a course code.</p>
+				<div class="course-map-row">
+					<input class="control" type="text" bind:value={courseCodeInput} placeholder="Course Code (e.g. VAR3033)" />
+					<input class="control" type="text" bind:value={fullCourseNameInput} placeholder="Full Course Name" />
+					<button class="btn" type="button" onclick={handleApplyCourseName} disabled={busy}>
+						Apply
+					</button>
+				</div>
+			</div>
 			{#if parseSummary}
 				<p class="status status-success">{parseSummary}</p>
 			{/if}
@@ -475,6 +617,27 @@
 		flex-wrap: wrap;
 	}
 
+	.course-map {
+		padding: 10px;
+		display: grid;
+		gap: 8px;
+	}
+
+	.course-map h3 {
+		margin: 0;
+		font-size: 15px;
+	}
+
+	.course-map p {
+		margin: 0;
+	}
+
+	.course-map-row {
+		display: grid;
+		grid-template-columns: 1fr 1fr auto;
+		gap: 8px;
+	}
+
 	.import-actions {
 		margin-top: 16px;
 		padding: 16px;
@@ -542,6 +705,10 @@
 		.hero {
 			flex-direction: column;
 			align-items: flex-start;
+		}
+
+		.course-map-row {
+			grid-template-columns: 1fr;
 		}
 	}
 </style>

@@ -96,6 +96,29 @@ describe('timetable parser helpers', () => {
 		});
 	});
 
+	it('emits missed-candidate recovery blocks when deterministic parse fails with time+week signals', () => {
+		const items = [
+			{ text: 'Monday', x: 129.55, y: 723 },
+			{ text: '(10:00 - 12:00)', x: 129.55, y: 640 },
+			{ text: 'KB-ROOM-500', x: 129.55, y: 629.5 },
+			{ text: 'SOME INSTRUCTOR', x: 129.55, y: 619 },
+			{ text: 'Wk:36-38', x: 129.55, y: 608.5 }
+		];
+
+		const parsed = __testables.parseLessonsWithCandidatesFromPositionedText(items);
+		expect(parsed.lessons).toHaveLength(0);
+		expect(parsed.missedCandidates).toHaveLength(1);
+		expect(parsed.missedCandidates[0]).toMatchObject({
+			day: 'Monday',
+			startTime: '10:00',
+			endTime: '12:00',
+			weeks: [36, 37, 38]
+		});
+		expect(parsed.missedCandidates[0].issues.map((issue) => issue.code)).toContain(
+			'missed_candidate_recovery'
+		);
+	});
+
 	it('maps the starting week date to the lowest week label', () => {
 		const lessons: ParsedLesson[] = [
 			{

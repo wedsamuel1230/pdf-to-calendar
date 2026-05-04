@@ -38,6 +38,7 @@ export interface ImportPreview {
 	occurrences: LessonOccurrence[];
 	minWeek: number;
 	maxWeek: number;
+	missedCandidates?: UnparsedLessonCandidate[];
 }
 
 export interface ImportResult {
@@ -51,4 +52,15 @@ export interface ImportResult {
 export interface ParseIssue {
 	code: string;
 	message: string;
+}
+
+export interface UnparsedLessonCandidate {
+	id: string;
+	day: DayLabel;
+	sourceText: string;
+	startTime?: string;
+	endTime?: string;
+	weeks: number[];
+	courseCode?: string;
+	issues: ParseIssue[];
 }
