@@ -39,6 +39,9 @@ export interface ImportPreview {
 	minWeek: number;
 	maxWeek: number;
 	missedCandidates?: UnparsedLessonCandidate[];
+	refinementStatus?: RefinementStatus;
+	refinedCount?: number;
+	parseRunId?: string;
 }
 
 export interface ImportResult {
@@ -64,3 +67,5 @@ export interface UnparsedLessonCandidate {
 	courseCode?: string;
 	issues: ParseIssue[];
 }
+
+export type RefinementStatus = 'idle' | 'running' | 'applied' | 'skipped' | 'timeout' | 'error';

@@ -23,11 +23,13 @@
 		parseTimetablePdfBytes,
 		rebuildPreviewFromLessons
 	} from '$lib/services/timetable-parser';
-	import { applyCourseNameMapping } from '$lib/services/course-name-mapping';
+import {
+	applyCourseNameMapping,
+	applyDefaultCourseNameMappings
+} from '$lib/services/course-name-mapping';
 	import {
 		getNvidiaModelStatus,
-		extractLessonsWithLlm,
-		repairLessonsWithLlm
+		refineLessonsWithLlm
 	} from '$lib/adapters/tauri/parser-repair';
 	import { appMessage, appStep } from '$lib/stores/import-state';
 	import type { NotionConfigInput, NotionTokenSource } from '$lib/types/notion';
@@ -35,7 +37,9 @@
 		ImportPreview,
 		ImportResult,
 		LessonOccurrence,
+		ParseIssue,
 		ParsedLesson,
+		RefinementStatus,
 		UnparsedLessonCandidate
 	} from '$lib/types/timetable';
 
@@ -61,6 +65,10 @@
 	let nvidiaHasApiKey = $state(false);
 	let courseCodeInput = $state('');
 	let fullCourseNameInput = $state('');
+	let activeParseRunId = '';
+
+	const LOW_CONFIDENCE_THRESHOLD = 0.7;
+	const LLM_TIMEOUT_MS = 8000;
 
 	let notionForm = $state<NotionConfigInput>({
 		databaseIdOrUrl: '',
@@ -159,11 +167,20 @@
 
 	let duplicateKeys = $derived(getDuplicateKeys(reviewOccurrences));
 
+	function createParseRunId(): string {
+		if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+			return crypto.randomUUID();
+		}
+		return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+	}
+
 	async function handleParse(): Promise<void> {
 		resetTransientMessages();
 		importProgress = 0;
 		try {
 			const weekDate = ensureStartDate(startWeekDate);
+			const parseRunId = createParseRunId();
+			activeParseRunId = parseRunId;
 			busy = true;
 			appStep.set('parsing');
 			appMessage.set('Parsing timetable...');
@@ -185,29 +202,9 @@
 					throw new Error(validation.message);
 				}
 			}
-			preview = await parseTimetablePdfBytes(data, weekDate);
-			let mergedLessons = [...preview.lessons];
-			const model = nvidiaModelOverride.trim() || selectedNvidiaModel || undefined;
-			const unresolvedCount = preview.missedCandidates?.length ?? 0;
-
-			if (llmRepairEnabled && nvidiaHasApiKey) {
-				const candidates = preview.missedCandidates ?? [];
-				if (candidates.length > 0) {
-					appMessage.set(`Recovering ${candidates.length} unresolved lesson blocks with NVIDIA LLM...`);
-					const recovered = await extractLessonsWithLlm(candidatesToLessons(candidates), model);
-					mergedLessons = mergeRecoveredLessons(mergedLessons, recovered);
-				}
-
-				const lowConfidence = mergedLessons.filter((item) => (item.confidence ?? 1) < 0.7);
-				if (lowConfidence.length > 0) {
-					const repaired = await repairLessonsWithLlm(lowConfidence, model);
-					mergedLessons = mergeRepairedLessons(mergedLessons, repaired);
-				}
-			} else if (llmRepairEnabled && !nvidiaHasApiKey) {
-				appMessage.set('LLM recovery is enabled, but NVIDIA API key was not detected. Parsed with deterministic mode only.');
-			}
-
-			if (mergedLessons.length === 0) {
+			const deterministicPreview = await parseTimetablePdfBytes(data, weekDate);
+			const unresolvedCount = deterministicPreview.missedCandidates?.length ?? 0;
+			if (deterministicPreview.lessons.length === 0) {
 				if (unresolvedCount > 0) {
 					throw new Error(
 						`No lessons were parsed. ${unresolvedCount} unresolved lesson candidates were detected. Enable LLM recovery with NVIDIA API key for fallback extraction.`
@@ -216,12 +213,42 @@
 				throw new Error('No lessons were detected from this PDF. Please review the timetable format.');
 			}
 
-			preview = rebuildPreviewFromLessons(mergedLessons, weekDate);
-			reviewOccurrences = [...preview.occurrences];
-			const lowConfidenceCount = mergedLessons.filter((item) => (item.confidence ?? 1) < 0.7).length;
-			parseSummary = `Parsed ${mergedLessons.length} lessons and ${preview.occurrences.length} event occurrences (Wk:${preview.minWeek}-${preview.maxWeek}). ${lowConfidenceCount} low-confidence lessons.`;
+			preview = {
+				...deterministicPreview,
+				parseRunId,
+				refinementStatus: llmRepairEnabled ? 'idle' : 'skipped',
+				refinedCount: 0
+			};
+			const mappedOccurrences = applyDefaultCourseNameMappings(deterministicPreview.occurrences);
+			reviewOccurrences = mappedOccurrences.updated;
+			const lowConfidenceCount = deterministicPreview.lessons.filter(
+				(item) => (item.confidence ?? 1) < LOW_CONFIDENCE_THRESHOLD
+			).length;
+			parseSummary = `Parsed ${deterministicPreview.lessons.length} lessons and ${deterministicPreview.occurrences.length} event occurrences (Wk:${deterministicPreview.minWeek}-${deterministicPreview.maxWeek}). ${lowConfidenceCount} low-confidence lessons.`;
 			appStep.set('review');
-			appMessage.set('Ready for review.');
+			appMessage.set(
+				unresolvedCount > 0
+					? `Deterministic parse complete with ${unresolvedCount} unresolved candidates.`
+					: `Deterministic parse complete. Applied ${mappedOccurrences.changed} course-name mappings. Ready for review.`
+			);
+
+			if (llmRepairEnabled) {
+				if (!nvidiaHasApiKey) {
+					if (preview) {
+						preview = {
+							...preview,
+							refinementStatus: 'skipped',
+							refinedCount: 0
+						};
+					}
+					appMessage.set(
+						'LLM refinement is enabled, but NVIDIA API key was not detected. Using deterministic parse only.'
+					);
+				} else {
+					const model = nvidiaModelOverride.trim() || selectedNvidiaModel || undefined;
+					void runBackgroundRefinement(parseRunId, weekDate, deterministicPreview, model);
+				}
+			}
 		} catch (error) {
 			errorText = error instanceof Error ? error.message : 'Failed to parse timetable.';
 			appStep.set('idle');
@@ -344,11 +371,42 @@
 		return [...weeks].sort((a, b) => a - b);
 	}
 
+	function isValidHhmm(value: string): boolean {
+		return /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
+	}
+
+	function nonEmpty(value: string | undefined): string | undefined {
+		const trimmed = value?.trim();
+		return trimmed && trimmed.length > 0 ? trimmed : undefined;
+	}
+
+	function preferText(existing: string | undefined, next: string | undefined): string | undefined {
+		const a = nonEmpty(existing);
+		const b = nonEmpty(next);
+		if (!a) {
+			return b;
+		}
+		if (!b) {
+			return a;
+		}
+		return b.length >= a.length ? b : a;
+	}
+
+	function preferIssues(existing: ParseIssue[] | undefined, next: ParseIssue[] | undefined): ParseIssue[] | undefined {
+		if (!existing || existing.length === 0) {
+			return next;
+		}
+		if (!next || next.length === 0) {
+			return next;
+		}
+		return next.length <= existing.length ? next : existing;
+	}
+
 	function candidatesToLessons(candidates: UnparsedLessonCandidate[]): ParsedLesson[] {
 		return candidates.map((candidate) => ({
 			id: candidate.id,
 			title: candidate.courseCode ?? 'RECOVERY_CANDIDATE',
-			courseCode: candidate.courseCode ?? 'RECOVERY0000',
+			courseCode: candidate.courseCode ?? 'RECOVERY_CANDIDATE',
 			day: candidate.day,
 			startTime: candidate.startTime ?? '00:00',
 			endTime: candidate.endTime ?? '00:00',
@@ -357,6 +415,36 @@
 			confidence: 0.2,
 			issues: candidate.issues
 		}));
+	}
+
+	function isValidRefinedLesson(item: ParsedLesson): boolean {
+		if (!item.id.trim()) {
+			return false;
+		}
+		if (!item.title.trim() || item.title.startsWith('RECOVERY_')) {
+			return false;
+		}
+		if (!item.courseCode.trim() || item.courseCode.startsWith('RECOVERY_')) {
+			return false;
+		}
+		if (!isValidHhmm(item.startTime) || !isValidHhmm(item.endTime)) {
+			return false;
+		}
+		if (!item.weeks.every((week) => Number.isInteger(week) && week > 0)) {
+			return false;
+		}
+		return ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'].includes(item.day);
+	}
+
+	function lessonQualityScore(item: ParsedLesson): number {
+		const confidence = Math.max(0, Math.min(1, item.confidence ?? 0.35));
+		const filled =
+			(item.venue ? 1 : 0) +
+			(item.instructor ? 1 : 0) +
+			(item.lessonType ? 1 : 0) +
+			(item.weeks.length > 0 ? 1 : 0);
+		const issuePenalty = item.issues?.length ?? 0;
+		return confidence * 100 + filled * 8 - issuePenalty * 5;
 	}
 
 	function lessonDedupKey(item: ParsedLesson): string {
@@ -369,23 +457,173 @@
 		].join('|');
 	}
 
-	function mergeRecoveredLessons(original: ParsedLesson[], recovered: ParsedLesson[]): ParsedLesson[] {
-		const merged = [...original];
-		const keys = new Set(original.map(lessonDedupKey));
-		for (const lesson of recovered) {
-			const key = lessonDedupKey(lesson);
-			if (keys.has(key)) {
+	function buildRefinementCandidates(source: ImportPreview): ParsedLesson[] {
+		const candidates: ParsedLesson[] = [];
+		const seen = new Set<string>();
+		for (const lesson of source.lessons) {
+			if ((lesson.confidence ?? 1) >= LOW_CONFIDENCE_THRESHOLD) {
 				continue;
 			}
-			keys.add(key);
-			merged.push({ ...lesson, repairedByLlm: true });
+			const key = lessonDedupKey(lesson);
+			if (seen.has(key)) {
+				continue;
+			}
+			seen.add(key);
+			candidates.push(lesson);
 		}
-		return merged;
+		for (const candidate of candidatesToLessons(source.missedCandidates ?? [])) {
+			const key = lessonDedupKey(candidate);
+			if (seen.has(key)) {
+				continue;
+			}
+			seen.add(key);
+			candidates.push(candidate);
+		}
+		return candidates;
 	}
 
-	function mergeRepairedLessons(original: ParsedLesson[], repaired: ParsedLesson[]): ParsedLesson[] {
-		const byId = new Map(repaired.map((item) => [item.id, item]));
-		return original.map((item) => byId.get(item.id) ?? item);
+	function mergeRefinedLessons(
+		original: ParsedLesson[],
+		refined: ParsedLesson[]
+	): { lessons: ParsedLesson[]; refinedCount: number } {
+		const merged = [...original];
+		const indexById = new Map<string, number>();
+		const indexByKey = new Map<string, number>();
+		for (let index = 0; index < merged.length; index += 1) {
+			indexById.set(merged[index].id, index);
+			indexByKey.set(lessonDedupKey(merged[index]), index);
+		}
+
+		let refinedCount = 0;
+		for (const lesson of refined) {
+			if (!isValidRefinedLesson(lesson)) {
+				continue;
+			}
+
+			const key = lessonDedupKey(lesson);
+			const currentIndex = indexById.get(lesson.id) ?? indexByKey.get(key);
+			if (currentIndex === undefined) {
+				merged.push({ ...lesson, repairedByLlm: true });
+				indexById.set(lesson.id, merged.length - 1);
+				indexByKey.set(key, merged.length - 1);
+				refinedCount += 1;
+				continue;
+			}
+
+			const current = merged[currentIndex];
+			if (lessonQualityScore(lesson) <= lessonQualityScore(current)) {
+				continue;
+			}
+
+			const updated: ParsedLesson = {
+				...current,
+				...lesson,
+				title: preferText(current.title, lesson.title) ?? current.title,
+				courseCode: preferText(current.courseCode, lesson.courseCode) ?? current.courseCode,
+				lessonType: preferText(current.lessonType, lesson.lessonType),
+				venue: preferText(current.venue, lesson.venue),
+				instructor: preferText(current.instructor, lesson.instructor),
+				sourceText: preferText(current.sourceText, lesson.sourceText) ?? current.sourceText,
+				weeks: lesson.weeks.length >= current.weeks.length ? lesson.weeks : current.weeks,
+				confidence: Math.max(current.confidence ?? 0, lesson.confidence ?? 0),
+				issues: preferIssues(current.issues, lesson.issues),
+				repairedByLlm: true
+			};
+			merged[currentIndex] = updated;
+			indexById.set(updated.id, currentIndex);
+			indexByKey.set(lessonDedupKey(updated), currentIndex);
+			refinedCount += 1;
+		}
+
+		return { lessons: merged, refinedCount };
+	}
+
+	async function runBackgroundRefinement(
+		parseRunId: string,
+		weekDate: string,
+		sourcePreview: ImportPreview,
+		model: string | undefined
+	): Promise<void> {
+		const candidates = buildRefinementCandidates(sourcePreview);
+		if (activeParseRunId !== parseRunId) {
+			return;
+		}
+		if (candidates.length === 0) {
+			const currentPreview = preview;
+			if (currentPreview?.parseRunId === parseRunId) {
+				preview = { ...currentPreview, refinementStatus: 'skipped', refinedCount: 0 };
+			}
+			appMessage.set('No low-confidence candidates required LLM refinement.');
+			return;
+		}
+
+		const currentPreview = preview;
+		if (currentPreview?.parseRunId === parseRunId) {
+			preview = { ...currentPreview, refinementStatus: 'running', refinedCount: 0 };
+		}
+		appMessage.set(`Running NVIDIA refinement in background for ${candidates.length} candidates...`);
+
+		try {
+			const refined = await refineLessonsWithLlm(candidates, model, { timeoutMs: LLM_TIMEOUT_MS });
+			if (activeParseRunId !== parseRunId || preview?.parseRunId !== parseRunId) {
+				return;
+			}
+
+			const merged = mergeRefinedLessons(sourcePreview.lessons, refined);
+			if (merged.refinedCount === 0) {
+				if (preview) {
+					preview = { ...preview, refinementStatus: 'skipped', refinedCount: 0 };
+				}
+				appMessage.set('LLM refinement finished with no higher-confidence updates.');
+				return;
+			}
+
+			const rebuilt = rebuildPreviewFromLessons(merged.lessons, weekDate);
+			const mappedOccurrences = applyDefaultCourseNameMappings(rebuilt.occurrences);
+			preview = {
+				...rebuilt,
+				missedCandidates: sourcePreview.missedCandidates,
+				refinementStatus: 'applied',
+				refinedCount: merged.refinedCount,
+				parseRunId
+			};
+			reviewOccurrences = mappedOccurrences.updated;
+			parseSummary = `${parseSummary} LLM refinement applied ${merged.refinedCount} updates.`;
+			appMessage.set(`Background refinement applied ${merged.refinedCount} lesson updates.`);
+		} catch (error) {
+			if (activeParseRunId !== parseRunId || preview?.parseRunId !== parseRunId) {
+				return;
+			}
+			const message = error instanceof Error ? error.message : 'LLM refinement failed.';
+			const status: RefinementStatus = /timed out/i.test(message) ? 'timeout' : 'error';
+			if (preview) {
+				preview = { ...preview, refinementStatus: status, refinedCount: 0 };
+			}
+			appMessage.set(`LLM refinement ${status}. Using deterministic results.`);
+		}
+	}
+
+	function refinementStatusText(value: ImportPreview | null): string {
+		const status = value?.refinementStatus;
+		if (!status) {
+			return '';
+		}
+		if (status === 'idle') {
+			return 'Refinement queued.';
+		}
+		if (status === 'running') {
+			return 'Refinement running...';
+		}
+		if (status === 'applied') {
+			return `Refinement applied (${value?.refinedCount ?? 0} updates).`;
+		}
+		if (status === 'skipped') {
+			return 'Refinement skipped.';
+		}
+		if (status === 'timeout') {
+			return 'Refinement timed out. Deterministic parse is kept.';
+		}
+		return 'Refinement failed. Deterministic parse is kept.';
 	}
 
 	function handleApplyCourseName(): void {
@@ -468,15 +706,15 @@
 				<input type="checkbox" bind:checked={llmRepairEnabled} />
 				<span class="text-muted">Enable LLM repair for low-confidence lessons</span>
 			</label>
-			{#if llmRepairEnabled}
-				<label>
-					<span class="text-muted">NVIDIA Model</span>
-					<select class="control" bind:value={selectedNvidiaModel}>
-						{#each nvidiaModels as model}
-							<option value={model}>{model}</option>
-						{/each}
-					</select>
-				</label>
+				{#if llmRepairEnabled}
+					<label>
+						<span class="text-muted">NVIDIA Model</span>
+						<select class="control control-model-large" bind:value={selectedNvidiaModel}>
+							{#each nvidiaModels as model}
+								<option value={model}>{model}</option>
+							{/each}
+						</select>
+					</label>
 				<label>
 					<span class="text-muted">Model Override (optional)</span>
 					<input class="control" type="text" bind:value={nvidiaModelOverride} placeholder="meta/llama-3.1-70b-instruct" />
@@ -507,6 +745,9 @@
 			</div>
 			{#if parseSummary}
 				<p class="status status-success">{parseSummary}</p>
+			{/if}
+			{#if refinementStatusText(preview)}
+				<p class="status status-warning">{refinementStatusText(preview)}</p>
 			{/if}
 			{#if $appMessage}
 				<p class="status">{ $appMessage }</p>
@@ -608,6 +849,12 @@
 		display: flex;
 		align-items: center;
 		gap: 8px;
+	}
+
+	.control-model-large {
+		min-height: 48px;
+		font-size: 16px;
+		padding: 12px 14px;
 	}
 
 	.nvidia-row {

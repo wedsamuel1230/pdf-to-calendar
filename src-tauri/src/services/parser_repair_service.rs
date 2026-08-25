@@ -26,6 +26,7 @@ const NVIDIA_FALLBACK_MODELS: [&str; 4] = [
 enum LlmMode {
     Repair,
     Extract,
+    Refine,
 }
 
 impl LlmMode {
@@ -33,6 +34,9 @@ impl LlmMode {
         if let Some(mode) = value {
             if mode.trim().eq_ignore_ascii_case("extract") {
                 return Self::Extract;
+            }
+            if mode.trim().eq_ignore_ascii_case("refine") {
+                return Self::Refine;
             }
         }
         Self::Repair
@@ -174,11 +178,7 @@ impl ParserRepairService {
         let token = load_nvidia_api_key();
         if token.is_none() || input.lessons.is_empty() {
             return Ok(RepairLessonResult {
-                lessons: if mode == LlmMode::Extract {
-                    vec![]
-                } else {
-                    input.lessons
-                },
+                lessons: fallback_lessons_for_mode(mode, input.lessons),
             });
         }
         let token = token.map(|item| item.value).unwrap_or_default();
@@ -195,6 +195,7 @@ impl ParserRepairService {
         let prompt = match mode {
             LlmMode::Repair => build_repair_prompt(&input.lessons),
             LlmMode::Extract => build_extract_prompt(&input.lessons),
+            LlmMode::Refine => build_refine_prompt(&input.lessons),
         };
         let url = format!("{}/chat/completions", nvidia_base_url());
         let payload = json!({
@@ -233,11 +234,7 @@ impl ParserRepairService {
             .collect::<Vec<_>>();
         if parsed.is_empty() {
             return Ok(RepairLessonResult {
-                lessons: if mode == LlmMode::Extract {
-                    vec![]
-                } else {
-                    input.lessons
-                },
+                lessons: fallback_lessons_for_mode(mode, input.lessons),
             });
         }
         Ok(RepairLessonResult { lessons: parsed })
@@ -274,6 +271,25 @@ fn build_extract_prompt(candidates: &[ParsedLessonForRepair]) -> String {
         "You are recovering missed timetable lessons from parser candidates.\nReturn strict JSON array only with complete lesson objects.\nRules:\n- Keep ids from input candidates.\n- Extract day/start_time/end_time/weeks/course_code/title from source_text.\n- Normalize start_time/end_time as HH:MM (24h).\n- weeks must be positive integers.\n- Keep confidence between 0.0 and 1.0 and provide issues.\nInput candidates:\n{}",
         json_candidates
     )
+}
+
+fn build_refine_prompt(candidates: &[ParsedLessonForRepair]) -> String {
+    let json_candidates =
+        serde_json::to_string(candidates).unwrap_or_else(|_| "[]".to_string());
+    format!(
+        "Refine timetable candidates and recover missed lessons.\nReturn strict JSON array only.\nRules:\n- Keep id values unchanged.\n- Normalize start_time/end_time to HH:MM.\n- Keep weeks as positive integers.\n- Improve fields only when supported by source_text.\n- Set confidence 0.0-1.0 and include concise issues.\nInput:\n{}",
+        json_candidates
+    )
+}
+
+fn fallback_lessons_for_mode(
+    mode: LlmMode,
+    lessons: Vec<ParsedLessonForRepair>,
+) -> Vec<ParsedLessonForRepair> {
+    match mode {
+        LlmMode::Extract | LlmMode::Refine => vec![],
+        LlmMode::Repair => lessons,
+    }
 }
 
 fn extract_json_array_text(content: &str) -> Option<String> {
@@ -333,4 +349,74 @@ fn nvidia_base_url() -> String {
         .unwrap_or_else(|_| NVIDIA_BASE_URL_DEFAULT.to_string())
         .trim_end_matches('/')
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::{
+        fallback_lessons_for_mode, load_nvidia_api_key, LlmMode, ParsedLessonForRepair,
+        NVIDIA_API_KEY_ENV_VARS,
+    };
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn sample_lesson() -> ParsedLessonForRepair {
+        ParsedLessonForRepair {
+            id: "id-1".to_string(),
+            title: "VAR3033 (Workshop)".to_string(),
+            course_code: "VAR3033".to_string(),
+            lesson_type: Some("Workshop".to_string()),
+            day: "Wednesday".to_string(),
+            start_time: "10:00".to_string(),
+            end_time: "12:00".to_string(),
+            venue: Some("KB-PAEN-609".to_string()),
+            instructor: Some("CHOY SHU SANG".to_string()),
+            weeks: vec![37, 38],
+            source_text: "sample".to_string(),
+            confidence: 0.7,
+            issues: vec![],
+        }
+    }
+
+    fn clear_nvidia_env() {
+        for key in NVIDIA_API_KEY_ENV_VARS {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    fn resolves_env_alias_priority() {
+        let _guard = ENV_LOCK.lock().expect("lock");
+        clear_nvidia_env();
+
+        std::env::set_var("nvapi", "nv-low");
+        std::env::set_var("NV_API_KEY", "nv-mid");
+        std::env::set_var("NVIDIA_API_KEY", "nv-top");
+
+        let resolved = load_nvidia_api_key().expect("should resolve env key");
+        assert_eq!(resolved.value, "nv-top");
+        assert_eq!(resolved.source_env_var, "NVIDIA_API_KEY");
+
+        clear_nvidia_env();
+    }
+
+    #[test]
+    fn parses_refine_mode() {
+        assert!(matches!(LlmMode::from_input(Some("refine")), LlmMode::Refine));
+        assert!(matches!(LlmMode::from_input(Some("extract")), LlmMode::Extract));
+        assert!(matches!(LlmMode::from_input(Some("repair")), LlmMode::Repair));
+    }
+
+    #[test]
+    fn fallback_returns_empty_for_extract_and_refine() {
+        let lessons = vec![sample_lesson()];
+        assert!(fallback_lessons_for_mode(LlmMode::Extract, lessons.clone()).is_empty());
+        assert!(fallback_lessons_for_mode(LlmMode::Refine, lessons.clone()).is_empty());
+        assert_eq!(
+            fallback_lessons_for_mode(LlmMode::Repair, lessons.clone()).len(),
+            lessons.len()
+        );
+    }
 }

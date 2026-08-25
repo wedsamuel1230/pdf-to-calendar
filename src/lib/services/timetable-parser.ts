@@ -14,17 +14,20 @@ interface PositionedText {
 	text: string;
 	x: number;
 	y: number;
+	page?: number;
 }
 
 interface DayAnchor {
 	day: DayLabel;
 	x: number;
+	page?: number;
 }
 
 interface DayRange {
 	day: DayLabel;
 	minX: number;
 	maxX: number;
+	page?: number;
 }
 
 interface ParseLessonsResult {
@@ -37,6 +40,8 @@ const TIME_RANGE_PATTERN = /(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})/;
 const VENUE_PATTERN = /[A-Z]{2,}-[A-Z0-9-]+/;
 const LESSON_TYPE_PATTERN = /\b(Lecture|Tutorial|Workshop|Lab|Seminar)\b/i;
 const HK_OFFSET = '+08:00';
+const MIN_WEEK = 1;
+const MAX_WEEK = 53;
 const LESSON_TYPE_MAP: Record<string, string> = {
 	LECTURE: 'Lecture',
 	TUTORIAL: 'Tutorial',
@@ -58,6 +63,22 @@ function normalizeText(value: string): string {
 	return value.replace(/\s+/g, ' ').trim();
 }
 
+function normalizeParserLine(value: string): string {
+	let normalized = normalizeText(value)
+		.replace(/[\u2013\u2014]/g, '-')
+		.replace(/[|]/g, ' ')
+		.replace(/W\W*k/gi, 'Wk')
+		.replace(/\(\s*(WS|L|T|LAB|SEM)\s*\)\s*\)+/gi, '($1)')
+		.replace(/\b(WS|LAB|SEM)\)+/gi, '($1)')
+		.replace(/\(\s+/g, '(')
+		.replace(/\s+\)/g, ')')
+		.replace(/\s*:\s*/g, ':');
+	if (/\b[A-Z]{3}\d{4}\s+\([A-Za-z]+$/i.test(normalized)) {
+		normalized = `${normalized})`;
+	}
+	return normalizeText(normalized);
+}
+
 function parseCourseCode(value: string): string | undefined {
 	return value.match(COURSE_CODE_PATTERN)?.[1];
 }
@@ -68,8 +89,8 @@ function normalizeTimeText(value: string): string {
 }
 
 function parseWeekExpression(value: string): number[] {
-	const source = value.replace(/^Wk\s*:?\s*/i, '').trim();
-	const tokens = source
+	const tokens = value
+		.replace(/^Wk\s*:?\s*/i, '')
 		.split(',')
 		.map((item) => item.trim())
 		.filter(Boolean);
@@ -98,18 +119,106 @@ function parseWeekExpression(value: string): number[] {
 	return [...result].sort((a, b) => a - b);
 }
 
-function parseWeekLine(value: string): number[] {
+interface WeekExtractionResult {
+	weeks: number[];
+	polluted: boolean;
+	outlierFiltered: boolean;
+}
+
+function parseWeekTokenList(rawValue: string): WeekExtractionResult {
+	const tokens = rawValue
+		.split(',')
+		.map((item) => item.trim())
+		.filter(Boolean);
+	const weeks = new Set<number>();
+	let polluted = false;
+	let outlierFiltered = false;
+
+	for (const token of tokens) {
+		if (!/^\d{1,2}(?:-\d{1,2})?$/.test(token)) {
+			polluted = true;
+			if (/\d{3,}/.test(token)) {
+				outlierFiltered = true;
+			}
+			continue;
+		}
+		const rangeMatch = token.match(/^(\d{1,2})-(\d{1,2})$/);
+		if (!rangeMatch) {
+			const week = Number(token);
+			if (week < MIN_WEEK || week > MAX_WEEK) {
+				outlierFiltered = true;
+				continue;
+			}
+			weeks.add(week);
+			continue;
+		}
+
+		const start = Number(rangeMatch[1]);
+		const end = Number(rangeMatch[2]);
+		const from = Math.min(start, end);
+		const to = Math.max(start, end);
+		if (to < MIN_WEEK || from > MAX_WEEK) {
+			outlierFiltered = true;
+			continue;
+		}
+		if (from < MIN_WEEK || to > MAX_WEEK) {
+			outlierFiltered = true;
+		}
+		for (let week = Math.max(from, MIN_WEEK); week <= Math.min(to, MAX_WEEK); week += 1) {
+			weeks.add(week);
+		}
+	}
+
+	return {
+		weeks: [...weeks].sort((a, b) => a - b),
+		polluted,
+		outlierFiltered
+	};
+}
+
+function extractWeekTokenSegment(value: string): { tokenSegment: string; polluted: boolean } | undefined {
 	const normalized = value
-		.replace(/W\s*k/gi, 'Wk')
+		.replace(/W\W*k/gi, 'Wk')
 		.replace(/[\u2013\u2014]/g, '-')
-		.replace(/\s+/g, '')
-		.replace(/;+$/g, '');
-	return parseWeekExpression(normalized);
+		.replace(/;+$/g, '')
+		.trim();
+	const wkMatch = normalized.match(/Wk\s*:?\s*/i);
+	if (!wkMatch || wkMatch.index === undefined) {
+		return undefined;
+	}
+	const remainder = normalized.slice(wkMatch.index + wkMatch[0].length);
+	let tokenSegment = '';
+	let sawDigit = false;
+	let polluted = false;
+	for (const char of remainder) {
+		if (/[0-9,\-\s]/.test(char)) {
+			tokenSegment += char;
+			sawDigit = sawDigit || /\d/.test(char);
+			continue;
+		}
+		if (sawDigit) {
+			polluted = true;
+		}
+		break;
+	}
+	tokenSegment = tokenSegment.trim().replace(/\s+/g, '');
+	if (!tokenSegment) {
+		return undefined;
+	}
+	return { tokenSegment, polluted };
+}
+
+function parseWeekLine(value: string): number[] {
+	const extracted = extractWeekTokenSegment(value);
+	if (!extracted) {
+		return [];
+	}
+	return parseWeekTokenList(extracted.tokenSegment).weeks;
 }
 
 function buildBlockLines(blockItems: PositionedText[]): string[] {
 	const sorted = [...blockItems]
-		.map((item) => ({ ...item, text: normalizeText(item.text) }))
+		.map((item) => ({ ...item, text: normalizeParserLine(item.text) }))
 		.filter((item) => item.text.length > 0)
 		.sort((a, b) => b.y - a.y || a.x - b.x);
 	const rows: Array<{ y: number; items: PositionedText[] }> = [];
@@ -124,7 +233,7 @@ function buildBlockLines(blockItems: PositionedText[]): string[] {
 		}
 	}
 
-	return rows
+	const lines = rows
 		.map((row) =>
 			normalizeText(
 				row.items
@@ -133,7 +242,21 @@ function buildBlockLines(blockItems: PositionedText[]): string[] {
 					.join(' ')
 			)
 		)
-		.filter(Boolean);
+		.filter((line) => Boolean(line) && !/^\d{1,2}:\d{2}$/.test(line));
+	const merged: string[] = [];
+	for (const line of lines) {
+		const previous = merged[merged.length - 1];
+		if (previous && /-$/.test(previous)) {
+			merged[merged.length - 1] = `${previous}${line}`;
+			continue;
+		}
+		if (previous && /\(\d{1,2}:\d{2}\s*-$/.test(previous)) {
+			merged[merged.length - 1] = `${previous}${line}`;
+			continue;
+		}
+		merged.push(line);
+	}
+	return merged;
 }
 
 function collectDayAnchors(items: PositionedText[]): DayAnchor[] {
@@ -144,7 +267,7 @@ function collectDayAnchors(items: PositionedText[]): DayAnchor[] {
 			continue;
 		}
 		const top = candidates.sort((a, b) => b.y - a.y)[0];
-		anchors.push({ day, x: top.x });
+		anchors.push({ day, x: top.x, page: top.page });
 	}
 	return anchors.sort((a, b) => a.x - b.x);
 }
@@ -157,7 +280,7 @@ function buildDayRanges(anchors: DayAnchor[]): DayRange[] {
 		const next = anchors[index + 1];
 		const minX = prev ? (prev.x + current.x) / 2 : current.x - 72;
 		const maxX = next ? (current.x + next.x) / 2 : current.x + 72;
-		ranges.push({ day: current.day, minX, maxX });
+		ranges.push({ day: current.day, minX, maxX, page: current.page });
 	}
 	return ranges;
 }
@@ -232,33 +355,87 @@ function findLessonType(
 	return { fromFragment: false, consumedIndexes: [] };
 }
 
-function extractWeekData(lines: string[]): { weeks: number[]; consumedIndexes: number[] } {
+function extractWeekData(lines: string[]): {
+	weeks: number[];
+	consumedIndexes: number[];
+	issues: ParseIssue[];
+} {
 	for (let index = 0; index < lines.length; index += 1) {
 		const line = lines[index];
 		if (!/W\s*k/i.test(line)) {
 			continue;
 		}
 
-		const direct = parseWeekLine(line);
-		if (direct.length > 0) {
-			return { weeks: direct, consumedIndexes: [index] };
+		const extracted = extractWeekTokenSegment(line);
+		if (extracted) {
+			const parsed = parseWeekTokenList(extracted.tokenSegment);
+			const issues: ParseIssue[] = [];
+			if (extracted.polluted || parsed.polluted) {
+				issues.push({
+					code: 'week_token_polluted',
+					message: 'Week token included extra non-week content and was sanitized.'
+				});
+			}
+			if (parsed.outlierFiltered) {
+				issues.push({
+					code: 'week_outlier_filtered',
+					message: 'Out-of-range week values were filtered to keep weeks within 1-53.'
+				});
+			}
+			if (parsed.weeks.length > 0) {
+				return { weeks: parsed.weeks, consumedIndexes: [index], issues };
+			}
 		}
 
 		const next = lines[index + 1];
 		if (next) {
-			const combined = parseWeekLine(`${line}${next}`);
-			if (combined.length > 0) {
-				return { weeks: combined, consumedIndexes: [index, index + 1] };
+			const extractedCombined = extractWeekTokenSegment(`${line} ${next}`);
+			if (extractedCombined) {
+				const parsed = parseWeekTokenList(extractedCombined.tokenSegment);
+				const issues: ParseIssue[] = [];
+				if (extractedCombined.polluted || parsed.polluted) {
+					issues.push({
+						code: 'week_token_polluted',
+						message: 'Week token included extra non-week content and was sanitized.'
+					});
+				}
+				if (parsed.outlierFiltered) {
+					issues.push({
+						code: 'week_outlier_filtered',
+						message: 'Out-of-range week values were filtered to keep weeks within 1-53.'
+					});
+				}
+				if (parsed.weeks.length > 0) {
+					return { weeks: parsed.weeks, consumedIndexes: [index, index + 1], issues };
+				}
 			}
 		}
 	}
 
-	const joined = lines.join(' ');
-	const match = joined.match(/W\s*k\s*:?\s*([0-9,\-\s]+)/i);
-	if (!match) {
-		return { weeks: [], consumedIndexes: [] };
+	for (const line of lines) {
+		const extracted = extractWeekTokenSegment(line);
+		if (!extracted) {
+			continue;
+		}
+		const parsed = parseWeekTokenList(extracted.tokenSegment);
+		const issues: ParseIssue[] = [];
+		if (extracted.polluted || parsed.polluted) {
+			issues.push({
+				code: 'week_token_polluted',
+				message: 'Week token included extra non-week content and was sanitized.'
+			});
+		}
+		if (parsed.outlierFiltered) {
+			issues.push({
+				code: 'week_outlier_filtered',
+				message: 'Out-of-range week values were filtered to keep weeks within 1-53.'
+			});
+		}
+		if (parsed.weeks.length > 0) {
+			return { weeks: parsed.weeks, consumedIndexes: [], issues };
+		}
 	}
-	return { weeks: parseWeekExpression(match[1]), consumedIndexes: [] };
+	return { weeks: [], consumedIndexes: [], issues: [] };
 }
 
 function extractTimeRange(lines: string[]): { startTime?: string; endTime?: string; lineIndex?: number } {
@@ -276,6 +453,48 @@ function extractTimeRange(lines: string[]): { startTime?: string; endTime?: stri
 	return {};
 }
 
+function selectCourseLine(
+	lines: string[],
+	timeLineIndex: number | undefined
+): { courseCode?: string; courseLine?: string; courseLineIndex?: number } {
+	const candidates = lines
+		.map((line, index) => ({ index, line, courseCode: parseCourseCode(line) }))
+		.filter((item): item is { index: number; line: string; courseCode: string } => Boolean(item.courseCode));
+	if (candidates.length === 0) {
+		return {};
+	}
+
+	if (timeLineIndex === undefined) {
+		return {
+			courseCode: candidates[0].courseCode,
+			courseLine: candidates[0].line,
+			courseLineIndex: candidates[0].index
+		};
+	}
+
+	candidates.sort((a, b) => Math.abs(a.index - timeLineIndex) - Math.abs(b.index - timeLineIndex));
+	return {
+		courseCode: candidates[0].courseCode,
+		courseLine: candidates[0].line,
+		courseLineIndex: candidates[0].index
+	};
+}
+
+function inferNearestCourseCode(dayItems: PositionedText[], y: number, x: number): string | undefined {
+	let best: { code: string; score: number } | undefined;
+	for (const item of dayItems) {
+		const code = parseCourseCode(item.text);
+		if (!code) {
+			continue;
+		}
+		const score = Math.abs(item.y - y) + Math.abs(item.x - x) * 0.3;
+		if (!best || score < best.score) {
+			best = { code, score };
+		}
+	}
+	return best?.code;
+}
+
 function buildUnparsedCandidate(
 	blockItems: PositionedText[],
 	day: DayLabel,
@@ -287,7 +506,7 @@ function buildUnparsedCandidate(
 	}
 
 	const timeRange = extractTimeRange(lines);
-	const { weeks } = extractWeekData(lines);
+	const { weeks, issues: weekIssues } = extractWeekData(lines);
 	if (!timeRange.startTime || !timeRange.endTime || weeks.length === 0) {
 		return undefined;
 	}
@@ -306,6 +525,7 @@ function buildUnparsedCandidate(
 		weeks,
 		courseCode,
 		issues: [
+			...weekIssues,
 			{
 				code: 'missed_candidate_recovery',
 				message: 'Deterministic parser flagged this block for LLM missed-lesson recovery.'
@@ -331,6 +551,28 @@ function cleanInstructorLine(value: string): { cleaned: string; removedFragment:
 	return { cleaned, removedFragment: cleaned !== normalized };
 }
 
+function classifyLineRole(line: string): 'course' | 'time' | 'week' | 'venue' | 'type' | 'instructor' | 'other' {
+	if (parseCourseCode(line)) {
+		return 'course';
+	}
+	if (TIME_RANGE_PATTERN.test(line)) {
+		return 'time';
+	}
+	if (VENUE_PATTERN.test(line)) {
+		return 'venue';
+	}
+	if (extractWeekTokenSegment(line)) {
+		return 'week';
+	}
+	if (isLessonTypeFragmentLine(line)) {
+		return 'type';
+	}
+	if (/^[A-Z][A-Z\s,.'-]{3,}$/.test(line)) {
+		return 'instructor';
+	}
+	return 'other';
+}
+
 function mergeInstructorLines(lines: string[]): string | undefined {
 	if (lines.length === 0) {
 		return undefined;
@@ -343,20 +585,11 @@ function mergeInstructorLines(lines: string[]): string | undefined {
 function parseLessonFromBlock(
 	blockItems: PositionedText[],
 	day: DayLabel,
-	fallbackId: string
+	fallbackId: string,
+	inferredCourseCode?: string
 ): ParsedLesson | undefined {
 	const lines = buildBlockLines(blockItems);
 	if (lines.length === 0) {
-		return undefined;
-	}
-
-	const courseLineIndex = lines.findIndex((line) => Boolean(parseCourseCode(line)));
-	if (courseLineIndex < 0) {
-		return undefined;
-	}
-	const courseLine = lines[courseLineIndex];
-	const courseCode = parseCourseCode(courseLine);
-	if (!courseCode) {
 		return undefined;
 	}
 
@@ -368,18 +601,35 @@ function parseLessonFromBlock(
 	const endTime = timeRange.endTime;
 	const timeLineIndex = timeRange.lineIndex;
 
-	const { weeks, consumedIndexes: consumedWeekIndexes } = extractWeekData(lines);
+	const { weeks, consumedIndexes: consumedWeekIndexes, issues: weekIssues } = extractWeekData(lines);
 	if (weeks.length === 0) {
 		return undefined;
 	}
 
-	const venueLineIndex = lines.findIndex((line) => VENUE_PATTERN.test(line));
+	const courseSelection = selectCourseLine(lines, timeLineIndex);
+	const courseCode = courseSelection.courseCode ?? inferredCourseCode;
+	if (!courseCode) {
+		return undefined;
+	}
+	const courseLine = courseSelection.courseLine ?? courseCode;
+	const courseLineIndex = courseSelection.courseLineIndex ?? -1;
+
+	const venueCandidates = lines
+		.map((line, index) => ({ index, line }))
+		.filter((item) => VENUE_PATTERN.test(item.line));
+	const venueLineIndex =
+		venueCandidates.length === 0
+			? -1
+			: venueCandidates.sort(
+					(a, b) =>
+						Math.abs(a.index - timeLineIndex) - Math.abs(b.index - timeLineIndex)
+				)[0].index;
 	const venue = venueLineIndex >= 0 ? lines[venueLineIndex] : undefined;
 
 	const lessonTypeInfo = findLessonType(lines, courseLine);
 	const lessonType = lessonTypeInfo.value;
 	const consumedLineIndexes = new Set<number>([
-		courseLineIndex,
+		...(courseLineIndex >= 0 ? [courseLineIndex] : []),
 		timeLineIndex,
 		venueLineIndex,
 		...consumedWeekIndexes,
@@ -393,7 +643,8 @@ function parseLessonFromBlock(
 			continue;
 		}
 		const line = lines[index];
-		if (!line || TIME_RANGE_PATTERN.test(line) || /W\s*k/i.test(line) || VENUE_PATTERN.test(line)) {
+		const role = classifyLineRole(line);
+		if (!line || role === 'time' || role === 'week' || role === 'venue' || role === 'course') {
 			continue;
 		}
 		if (/^[\d:()\-\s]+$/.test(line)) {
@@ -420,6 +671,12 @@ function parseLessonFromBlock(
 	if (!lessonType) {
 		issues.push({ code: 'missing_lesson_type', message: 'Lesson type was not detected from this lesson block.' });
 	}
+	if (!courseSelection.courseCode && inferredCourseCode) {
+		issues.push({
+			code: 'course_inferred',
+			message: 'Course code was inferred from nearby lines due to split lesson block.'
+		});
+	}
 	if (lessonTypeInfo.fromFragment) {
 		issues.push({ code: 'lesson_type_fragment', message: 'Lesson type was recovered from an abbreviated fragment.' });
 	}
@@ -429,6 +686,7 @@ function parseLessonFromBlock(
 	if (hadInstructorPollution) {
 		issues.push({ code: 'instructor_polluted', message: 'Instructor line had lesson-type fragments that were removed.' });
 	}
+	issues.push(...weekIssues);
 	const confidence = Math.max(0.35, 1 - issues.length * 0.1);
 
 	return {
@@ -569,6 +827,128 @@ function lessonParseKey(lesson: ParsedLesson): string {
 	return `${lesson.day}|${lesson.startTime}|${lesson.endTime}|${lesson.courseCode}|${lesson.weeks.join(',')}`;
 }
 
+function lessonBaseKey(lesson: ParsedLesson): string {
+	return `${lesson.day}|${lesson.startTime}|${lesson.endTime}|${lesson.courseCode}|${lesson.venue ?? ''}`;
+}
+
+function lessonQualityScore(lesson: ParsedLesson): number {
+	const issuePenalty = lesson.issues?.length ?? 0;
+	const confidence = lesson.confidence ?? 0.5;
+	const hasVenue = lesson.venue ? 1 : 0;
+	const hasInstructor = lesson.instructor ? 1 : 0;
+	const weekSpan = lesson.weeks.length;
+	return confidence * 100 + hasVenue * 8 + hasInstructor * 8 + weekSpan - issuePenalty * 6;
+}
+
+function shouldStitchCandidatePair(current: PositionedText, next: PositionedText | undefined): boolean {
+	if (!next) {
+		return false;
+	}
+	const deltaY = current.y - next.y;
+	if (deltaY <= 0 || deltaY > 68) {
+		return false;
+	}
+	if (Math.abs(current.x - next.x) > 14) {
+		return false;
+	}
+	const currentHasTime = TIME_RANGE_PATTERN.test(current.text);
+	const currentHasWeek = /W\W*k/i.test(current.text);
+	const nextHasTime = TIME_RANGE_PATTERN.test(next.text);
+	const nextHasWeek = /W\W*k/i.test(next.text);
+	return (currentHasTime && nextHasWeek) || (currentHasWeek && nextHasTime);
+}
+
+function dedupBlockItems(items: PositionedText[]): PositionedText[] {
+	const map = new Map<string, PositionedText>();
+	for (const item of items) {
+		const key = `${item.text}|${Math.round(item.x * 10) / 10}|${Math.round(item.y * 10) / 10}`;
+		if (!map.has(key)) {
+			map.set(key, item);
+		}
+	}
+	return [...map.values()];
+}
+
+function buildCandidateBlock(
+	dayItems: PositionedText[],
+	candidate: PositionedText,
+	next: PositionedText | undefined
+): PositionedText[] {
+	let lowerBoundary = next && candidate.y - next.y > 55 ? next.y + 1.5 : -Infinity;
+	let blockItems = dayItems.filter(
+		(item) => item.y <= candidate.y + 4 && item.y > lowerBoundary && item.y >= candidate.y - 145
+	);
+
+	if (shouldStitchCandidatePair(candidate, next)) {
+		const stitched = dayItems.filter((item) => item.y <= next!.y + 52 && item.y >= next!.y - 86);
+		blockItems = dedupBlockItems([...blockItems, ...stitched]);
+	}
+
+	return blockItems;
+}
+
+function dedupIssues(issues: ParseIssue[] | undefined): ParseIssue[] {
+	if (!issues || issues.length === 0) {
+		return [];
+	}
+	const seen = new Set<string>();
+	const result: ParseIssue[] = [];
+	for (const issue of issues) {
+		const key = `${issue.code}|${issue.message}`;
+		if (seen.has(key)) {
+			continue;
+		}
+		seen.add(key);
+		result.push(issue);
+	}
+	return result;
+}
+
+function consolidateLessons(lessons: ParsedLesson[]): ParsedLesson[] {
+	const byBase = new Map<string, ParsedLesson[]>();
+	for (const lesson of lessons) {
+		const key = lessonBaseKey(lesson);
+		const list = byBase.get(key) ?? [];
+		list.push(lesson);
+		byBase.set(key, list);
+	}
+
+	const consolidated: ParsedLesson[] = [];
+	for (const group of byBase.values()) {
+		const sorted = [...group].sort((a, b) => lessonQualityScore(b) - lessonQualityScore(a));
+		const best = sorted[0];
+		const mergedWeeks = new Set<number>();
+		for (const item of sorted) {
+			for (const week of item.weeks) {
+				if (week >= MIN_WEEK && week <= MAX_WEEK) {
+					mergedWeeks.add(week);
+				}
+			}
+		}
+
+		const fallbackVenue = sorted.find((item) => item.venue)?.venue;
+		const fallbackInstructor = sorted.find((item) => item.instructor)?.instructor;
+		const issues = dedupIssues(sorted.flatMap((item) => item.issues ?? []));
+		if (group.length > 1) {
+			issues.push({
+				code: 'block_bleed_detected',
+				message: 'Overlapping lesson fragments were merged to avoid duplicate split rows.'
+			});
+		}
+
+		consolidated.push({
+			...best,
+			venue: best.venue ?? fallbackVenue,
+			instructor: best.instructor ?? fallbackInstructor,
+			weeks: [...mergedWeeks].sort((a, b) => a - b),
+			issues,
+			confidence: Math.min(0.98, Math.max(...sorted.map((item) => item.confidence ?? 0.35)))
+		});
+	}
+
+	return consolidated;
+}
+
 function parseLessonsWithCandidatesFromPositionedText(items: PositionedText[]): ParseLessonsResult {
 	const dayAnchors = collectDayAnchors(items);
 	if (dayAnchors.length === 0) {
@@ -578,13 +958,15 @@ function parseLessonsWithCandidatesFromPositionedText(items: PositionedText[]): 
 	const dayRanges = buildDayRanges(dayAnchors);
 	const contentItems = items.filter((item) => item.y < 700);
 	const blockCandidates = contentItems
-		.filter((item) => isAnchorSignal(item.text))
+		// Course codes are stable block starts. Week and time anchors can be wrapped onto
+		// separate PDF text lines, so treating them as the next-block boundary truncates cells.
+		.filter((item) => Boolean(parseCourseCode(item.text)))
 		.map((item) => ({ ...item, day: findDayByX(item.x, dayRanges) }))
 		.filter((item): item is PositionedText & { day: DayLabel } => Boolean(item.day));
 
 	const dedup = new Map<string, PositionedText & { day: DayLabel; priority: number }>();
 	for (const candidate of blockCandidates) {
-		const key = `${candidate.day}:${Math.round(candidate.y * 2) / 2}`;
+		const key = `${candidate.day}:${Math.round(candidate.y * 2) / 2}:${Math.round(candidate.x * 2) / 2}`;
 		const priority = anchorPriority(candidate.text);
 		const existing = dedup.get(key);
 		if (!existing || priority > existing.priority) {
@@ -602,27 +984,49 @@ function parseLessonsWithCandidatesFromPositionedText(items: PositionedText[]): 
 	const lessons: ParsedLesson[] = [];
 	const missedCandidates: UnparsedLessonCandidate[] = [];
 	for (const day of DAY_LABELS) {
-		const dayCandidates = groups.get(day);
+		const dayCandidates = groups.get(day) ?? [];
 		const dayRange = dayRanges.find((range) => range.day === day);
-		if (!dayRange || !dayCandidates) {
+		if (!dayRange) {
 			continue;
 		}
 
 		const dayItems = contentItems
-			.filter((item) => item.x >= dayRange.minX && item.x < dayRange.maxX)
+			.filter(
+				(item) =>
+					item.page === dayRange.page && item.x >= dayRange.minX && item.x < dayRange.maxX
+			)
 			.sort((a, b) => b.y - a.y || a.x - b.x);
 		const sortedCandidates = [...dayCandidates].sort((a, b) => b.y - a.y);
 
 		for (let index = 0; index < sortedCandidates.length; index += 1) {
 			const candidate = sortedCandidates[index];
 			const next = sortedCandidates[index + 1];
-			const lowerBoundary =
-				next && candidate.y - next.y > 55 ? next.y + 1.5 : -Infinity;
-			const blockItems = dayItems.filter(
-				(item) => item.y <= candidate.y + 4 && item.y > lowerBoundary && item.y >= candidate.y - 145
+			// A day may contain parallel classes. Keep each course block local to its
+			// horizontal text column while allowing wrapped continuation text to indent.
+			const columnCandidates = [...new Map(
+				sortedCandidates
+					.sort((a, b) => a.x - b.x)
+					.map((item) => [`${Math.round(item.x * 2) / 2}`, item])
+			)].map(([, item]) => item);
+			const columnIndex = columnCandidates.findIndex(
+				(item) => Math.abs(item.x - candidate.x) <= 0.5
 			);
+			const previousColumn = columnCandidates[columnIndex - 1];
+			const nextColumn = columnCandidates[columnIndex + 1];
+			const cellMinX = previousColumn
+				? (previousColumn.x + candidate.x) / 2
+				: Math.max(dayRange.minX, candidate.x - 10);
+			const cellMaxX = nextColumn
+				? (candidate.x + nextColumn.x) / 2
+				: Math.max(dayRange.maxX, candidate.x + 46);
+			const cellItems = contentItems.filter(
+				(item) =>
+					item.page === candidate.page && item.x >= cellMinX && item.x < cellMaxX
+			);
+			const blockItems = buildCandidateBlock(cellItems, candidate, next);
 			const lessonId = `${candidate.day}-${Math.round(candidate.y)}-${parseCourseCode(candidate.text) ?? 'candidate'}`;
-			const parsed = parseLessonFromBlock(blockItems, day, lessonId);
+			const inferredCourseCode = inferNearestCourseCode(dayItems, candidate.y, candidate.x);
+			const parsed = parseLessonFromBlock(blockItems, day, lessonId, inferredCourseCode);
 			if (parsed) {
 				lessons.push(parsed);
 				continue;
@@ -637,7 +1041,18 @@ function parseLessonsWithCandidatesFromPositionedText(items: PositionedText[]): 
 		const timeAnchors = dayItems.filter((item) => TIME_RANGE_PATTERN.test(item.text));
 		for (const anchor of timeAnchors) {
 			const blockItems = dayItems.filter((item) => item.y <= anchor.y + 44 && item.y >= anchor.y - 96);
-			const parsed = parseLessonFromBlock(blockItems, day, `${day}-${Math.round(anchor.y)}-scan`);
+			const blockLines = buildBlockLines(blockItems);
+			const hasWeekSignal = extractWeekData(blockLines).weeks.length > 0;
+			if (!hasWeekSignal) {
+				continue;
+			}
+			const inferredCourseCode = inferNearestCourseCode(dayItems, anchor.y, anchor.x);
+			const parsed = parseLessonFromBlock(
+				blockItems,
+				day,
+				`${day}-${Math.round(anchor.y)}-scan`,
+				inferredCourseCode
+			);
 			if (parsed) {
 				continue;
 			}
@@ -652,10 +1067,12 @@ function parseLessonsWithCandidatesFromPositionedText(items: PositionedText[]): 
 		}
 	}
 
+	const consolidatedLessons = consolidateLessons(lessons);
 	const unique = new Map<string, ParsedLesson>();
-	for (const lesson of lessons) {
+	for (const lesson of consolidatedLessons) {
 		const key = lessonParseKey(lesson);
-		if (!unique.has(key)) {
+		const existing = unique.get(key);
+		if (!existing || lessonQualityScore(lesson) > lessonQualityScore(existing)) {
 			unique.set(key, lesson);
 		}
 	}
@@ -695,7 +1112,8 @@ async function extractPositionedTextFromPdfBytes(data: Uint8Array): Promise<Posi
 			items.push({
 				text,
 				x: item.transform[4],
-				y: item.transform[5]
+				y: item.transform[5],
+				page: pageIndex
 			});
 		}
 	}
